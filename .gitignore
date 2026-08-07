@@ -151,3 +151,14 @@ Thumbs.db
 # BPE vocabulary files
 *.bpe
 *.vocab
+
+outputs
+assets/bbox
+assets/bbox2
+assets/images/*.png
+assets/images2
+assets/reference
+assets/scene_meta
+assets/scene_meta2
+assets/conf
+assets/objects_metadata.csv
