@@ -15,6 +15,11 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
+if __package__:
+    from .real_object_catalog import resolve_real_object
+else:  # pragma: no cover - exercised by direct CLI execution
+    from real_object_catalog import resolve_real_object
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -22,6 +27,15 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--image", type=Path, required=True)
     parser.add_argument("--object-name", required=True)
+    parser.add_argument(
+        "--objects-metadata",
+        type=Path,
+        help=(
+            "Optional objects_metadata.csv. When provided, Object_name, "
+            "Old_name, or Class_name input is normalized to the real pipeline "
+            "key (Old_name first, Object_name fallback)."
+        ),
+    )
     parser.add_argument("--bbox-dir", type=Path, default=Path("assets/reference"))
     parser.add_argument(
         "--reference-index",
@@ -65,6 +79,7 @@ def update_reference_index(
     object_name: str,
     reference_image: Path,
     bbox_annotation: Path,
+    identity_metadata: dict[str, object] | None = None,
 ) -> None:
     """객체 이름으로 reference와 BBox를 즉시 찾는 인덱스를 갱신한다."""
     index_path.parent.mkdir(parents=True, exist_ok=True)
@@ -73,14 +88,19 @@ def update_reference_index(
     else:
         index = {"objects": {}}
     objects = index.setdefault("objects", {})
-    objects[object_name] = {
+    entry: dict[str, object] = {
         "reference_image": Path(
             os.path.relpath(reference_image, start=index_path.parent.resolve())
         ).as_posix(),
         "bbox_annotation": Path(
-            os.path.relpath(bbox_annotation.resolve(), start=index_path.parent.resolve())
+            os.path.relpath(
+                bbox_annotation.resolve(), start=index_path.parent.resolve()
+            )
         ).as_posix(),
     }
+    if identity_metadata:
+        entry.update(identity_metadata)
+    objects[object_name] = entry
 
     # 쓰는 도중 중단되어 기존 인덱스가 손상되지 않도록 임시 파일을 교체한다.
     temporary_path = index_path.with_suffix(index_path.suffix + ".tmp")
@@ -90,6 +110,13 @@ def update_reference_index(
 
 def main() -> None:
     args = parse_args()
+    identity = (
+        resolve_real_object(args.object_name, args.objects_metadata)
+        if args.objects_metadata is not None
+        else None
+    )
+    object_name = identity.applied_key if identity is not None else args.object_name
+    identity_metadata = identity.metadata() if identity is not None else None
     image_path = args.image.resolve()
     if not image_path.is_file():
         raise FileNotFoundError(f"Reference image not found: {image_path}")
@@ -111,9 +138,11 @@ def main() -> None:
             interpolation=cv2.INTER_AREA,
         )
 
-    window_name = f"Select BBox: {args.object_name} (ENTER/SPACE=save, C=cancel)"
+    window_name = f"Select BBox: {object_name} (ENTER/SPACE=save, C=cancel)"
     x, y, box_width, box_height = cv2.selectROI(
-        window_name, display, showCrosshair=True, fromCenter=False
+        # The crosshair is only an OpenCV selection guide, but it looks like
+        # extra BBoxes in the UI.  Show only the actual ROI outline.
+        window_name, display, showCrosshair=False, fromCenter=False
     )
     cv2.destroyAllWindows()
     if box_width <= 0 or box_height <= 0:
@@ -129,8 +158,8 @@ def main() -> None:
     output_path = args.bbox_dir / f"{image_path.stem}.json"
     relative_image = os.path.relpath(image_path, start=args.bbox_dir.resolve())
     bbox = [round(x1, 2), round(y1, 2), round(x2, 2), round(y2, 2)]
-    record = {
-        "object_name": args.object_name,
+    record: dict[str, object] = {
+        "object_name": object_name,
         "reference_image": Path(relative_image).as_posix(),
         "bbox_format": "xyxy",
         "bbox": bbox,
@@ -138,20 +167,29 @@ def main() -> None:
         "image_height": height,
         "exif_orientation_applied": True,
     }
+    if identity_metadata:
+        record.update(identity_metadata)
     output_path.write_text(json.dumps(record, indent=2), encoding="utf-8")
     # 원본 reference 이미지와 혼동되지 않도록 검수용 파생 이미지임을 파일명에 표시한다.
     preview_path = args.bbox_dir / f"{image_path.stem}_preview.jpg"
-    save_bbox_preview(image, bbox, args.object_name, preview_path)
+    save_bbox_preview(image, bbox, object_name, preview_path)
     update_reference_index(
         index_path=args.reference_index,
-        object_name=args.object_name,
+        object_name=object_name,
         reference_image=image_path,
         bbox_annotation=output_path,
+        identity_metadata=identity_metadata,
     )
     print(f"Saved reference annotation: {output_path}")
     print(f"Saved reference preview: {preview_path}")
     print(f"Updated reference index: {args.reference_index}")
-    print(f"object_name={args.object_name}, bbox={record['bbox']}")
+    if identity is not None:
+        print(
+            f"Resolved object query {args.object_name!r} via "
+            f"{identity.matched_field} to real key {object_name!r} "
+            f"({identity.object_id})."
+        )
+    print(f"object_name={object_name}, bbox={record['bbox']}")
 
 
 if __name__ == "__main__":
