@@ -58,10 +58,10 @@ python examples/cross_image_exemplar.py \
 
 ```bash
 python examples/label_real_reference.py \
-  --image /media/uon/data1/gemini/reference/0000.png \
+  --image /media/uon/data1/gemini/reference/paper_cup/0000.png \
   --object-name paper_cup \
   --objects-metadata /media/uon/data1/gemini/objects_metadata.csv \
-  --bbox-dir /media/uon/data1/gemini/reference \
+  --bbox-dir /media/uon/data1/gemini/reference/paper_cup \
   --reference-index /media/uon/data1/gemini/reference/reference_index.json
 ```
 

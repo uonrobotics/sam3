@@ -102,6 +102,48 @@ def test_target_images_are_selected_from_manifest(tmp_path):
     assert [path.name for path in selected] == ["selected_b.jpg", "selected_a.png"]
 
 
+def test_reference_loader_resolves_reference_gen_object_directory(tmp_path):
+    reference_root = tmp_path / "reference"
+    object_dir = reference_root / "paper_cup"
+    object_dir.mkdir(parents=True)
+    reference_image = object_dir / "0000.png"
+    Image.new("RGB", (20, 10)).save(reference_image)
+    annotation_path = object_dir / "0000.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                "object_name": "paper_cup",
+                "bbox_format": "xyxy",
+                "bbox": [1, 1, 19, 9],
+                "image_width": 20,
+                "image_height": 10,
+            }
+        ),
+        encoding="utf-8",
+    )
+    index_path = reference_root / "reference_index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "objects": {
+                    "paper_cup": {
+                        "reference_image": "paper_cup/0000.png",
+                        "bbox_annotation": "paper_cup/0000.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded_image, annotation = load_reference_annotation(
+        "paper_cup", index_path
+    )
+
+    assert loaded_image == reference_image.resolve()
+    assert annotation["bbox"] == [1, 1, 19, 9]
+
+
 def _paper_cup_identity() -> RealObjectIdentity:
     return RealObjectIdentity(
         applied_key="paper_cup",

@@ -137,3 +137,29 @@ def test_reference_index_without_catalog_keeps_legacy_shape(tmp_path):
         "reference_image": "reference.jpg",
         "bbox_annotation": "reference.json",
     }
+
+
+def test_reference_index_supports_object_scoped_reference_gen_paths(tmp_path):
+    reference_root = tmp_path / "reference"
+    object_dir = reference_root / "paper_cup"
+    object_dir.mkdir(parents=True)
+    reference_image = object_dir / "0000.png"
+    bbox_annotation = object_dir / "0000.json"
+    reference_image.write_bytes(b"image")
+    bbox_annotation.write_text("{}", encoding="utf-8")
+    index_path = reference_root / "reference_index.json"
+
+    update_reference_index(
+        index_path=index_path,
+        object_name="paper_cup",
+        reference_image=reference_image,
+        bbox_annotation=bbox_annotation,
+    )
+
+    entry = json.loads(index_path.read_text(encoding="utf-8"))["objects"][
+        "paper_cup"
+    ]
+    assert entry == {
+        "reference_image": "paper_cup/0000.png",
+        "bbox_annotation": "paper_cup/0000.json",
+    }
