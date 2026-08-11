@@ -22,6 +22,11 @@ from sam3.model.sam3_image_processor import Sam3Processor
 from sam3.model_builder import build_sam3_image_model
 from sam3.visualization_utils import normalize_bbox
 
+if __package__:
+    from .real_object_catalog import RealObjectIdentity, resolve_real_object
+else:  # pragma: no cover - exercised by direct CLI execution
+    from real_object_catalog import RealObjectIdentity, resolve_real_object
+
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 
@@ -42,11 +47,20 @@ def parse_args() -> argparse.Namespace:
         description="Batch SAM 3 inference using a stitched real-image exemplar."
     )
     parser.add_argument("--object-name", required=True)
+    parser.add_argument(
+        "--objects-metadata",
+        type=Path,
+        help=(
+            "Optional objects_metadata.csv. When provided, Object_name, "
+            "Old_name, or Class_name input is normalized to the real pipeline "
+            "key (Old_name first, Object_name fallback)."
+        ),
+    )
     parser.add_argument("--image-dir", type=Path, default=Path("assets/images2"))
     parser.add_argument(
         "--reference-index",
         type=Path,
-        default=Path("assets/references2/reference_index.json"),
+        default=Path("assets/reference/reference_index.json"),
     )
     parser.add_argument(
         "--scene-meta",
@@ -81,22 +95,44 @@ def load_oriented_rgb(path: Path) -> Image.Image:
 
 
 def load_reference_annotation(
-    object_name: str, reference_index_path: Path
+    object_name: str,
+    reference_index_path: Path,
+    *,
+    expected_identity: RealObjectIdentity | None = None,
 ) -> tuple[Path, dict]:
     """인덱스에서 객체 이름으로 reference와 BBox JSON을 직접 찾는다."""
     if not reference_index_path.is_file():
         raise FileNotFoundError(f"Reference index not found: {reference_index_path}")
     index = json.loads(reference_index_path.read_text(encoding="utf-8"))
-    entry = index.get("objects", {}).get(object_name)
+    if not isinstance(index, dict) or not isinstance(index.get("objects"), dict):
+        raise ValueError(
+            f"Reference index must contain an objects mapping: "
+            f"{reference_index_path}"
+        )
+    entry = index["objects"].get(object_name)
     if entry is None:
         raise KeyError(
             f"Object {object_name!r} not found in reference index "
             f"{reference_index_path}"
         )
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Reference entry for {object_name!r} must be an object in "
+            f"{reference_index_path}."
+        )
+    if expected_identity is not None:
+        _validate_identity_metadata(
+            entry,
+            expected_identity,
+            source=f"reference index {reference_index_path}",
+        )
 
     reference_value = entry.get("reference_image")
     annotation_value = entry.get("bbox_annotation")
-    if not reference_value or not annotation_value:
+    if not all(
+        isinstance(value, str) and value
+        for value in (reference_value, annotation_value)
+    ):
         raise ValueError(
             f"Incomplete reference entry for {object_name!r} in {reference_index_path}"
         )
@@ -108,41 +144,120 @@ def load_reference_annotation(
         raise FileNotFoundError(f"BBox annotation not found: {annotation_path}")
 
     annotation = json.loads(annotation_path.read_text(encoding="utf-8"))
+    if not isinstance(annotation, dict):
+        raise ValueError(f"BBox annotation must be an object: {annotation_path}")
     if annotation.get("object_name") != object_name:
         raise ValueError(
             f"Object mismatch: index={object_name!r}, "
             f"annotation={annotation.get('object_name')!r}"
         )
+    if expected_identity is not None:
+        _validate_identity_metadata(
+            annotation,
+            expected_identity,
+            source=f"BBox annotation {annotation_path}",
+        )
     return reference_path, annotation
 
 
 def load_target_image_paths(
-    object_name: str, image_dir: Path, scene_meta_path: Path
+    object_name: str,
+    image_dir: Path,
+    scene_meta_path: Path,
+    *,
+    expected_identity: RealObjectIdentity | None = None,
 ) -> list[Path]:
     """수집 metadata에서 해당 객체로 등록된 target 이미지만 반환한다."""
     if not scene_meta_path.is_file():
         raise FileNotFoundError(f"Capture manifest not found: {scene_meta_path}")
     manifest = json.loads(scene_meta_path.read_text(encoding="utf-8"))
-    entry = manifest.get("objects", {}).get(object_name)
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Capture manifest must be an object: {scene_meta_path}")
+    objects = manifest.get("objects")
+    if not isinstance(objects, dict):
+        raise ValueError(
+            f"Capture manifest must contain an objects mapping: {scene_meta_path}"
+        )
+    entry = objects.get(object_name)
     if entry is None:
         raise KeyError(
             f"Object {object_name!r} not found in capture manifest {scene_meta_path}"
         )
+    if not isinstance(entry, dict):
+        raise ValueError(
+            f"Capture manifest entry for {object_name!r} must be an object."
+        )
+    if expected_identity is not None:
+        catalog = manifest.get("object_catalog")
+        if not isinstance(catalog, dict):
+            raise ValueError(
+                "Capture manifest has no object_catalog provenance while "
+                "--objects-metadata is enabled."
+            )
+        manifest_hash = catalog.get("sha256")
+        if manifest_hash != expected_identity.object_catalog_sha256:
+            raise ValueError(
+                "Capture manifest object catalog SHA-256 does not match the "
+                "selected objects_metadata.csv: "
+                f"{manifest_hash!r} != "
+                f"{expected_identity.object_catalog_sha256!r}."
+            )
+        _validate_identity_metadata(
+            entry,
+            expected_identity,
+            source=f"capture manifest {scene_meta_path}",
+        )
     image_names = entry.get("images", [])
-    if not image_names:
+    if not isinstance(image_names, list) or not image_names:
         raise ValueError(f"No target images registered for {object_name!r}")
+    if not all(isinstance(name, str) and name for name in image_names):
+        raise ValueError(
+            f"Target image names for {object_name!r} must be non-empty strings."
+        )
     if len(image_names) != len(set(image_names)):
         raise ValueError(f"Duplicate target image names for {object_name!r}")
 
+    image_root = image_dir.resolve()
     image_paths: list[Path] = []
     for image_name in image_names:
-        image_path = (image_dir / image_name).resolve()
+        relative_path = Path(image_name)
+        if relative_path.is_absolute() or ".." in relative_path.parts:
+            raise ValueError(
+                f"Target image must be relative to --image-dir: {image_name!r}"
+            )
+        image_path = (image_root / relative_path).resolve()
+        try:
+            image_path.relative_to(image_root)
+        except ValueError as exc:
+            raise ValueError(
+                f"Target image escapes --image-dir: {image_name!r}"
+            ) from exc
         if not image_path.is_file():
             raise FileNotFoundError(f"Target image not found: {image_path}")
         if image_path.suffix.lower() not in IMAGE_SUFFIXES:
             raise ValueError(f"Unsupported target image suffix: {image_path}")
         image_paths.append(image_path)
     return image_paths
+
+
+def _validate_identity_metadata(
+    document: dict,
+    identity: RealObjectIdentity,
+    *,
+    source: str,
+) -> None:
+    """Require an artifact to match the selected immutable catalog row."""
+
+    for field, expected in identity.metadata().items():
+        if field not in document:
+            raise ValueError(
+                f"{source} is missing catalog identity field {field!r}."
+            )
+        actual = document[field]
+        if actual != expected:
+            raise ValueError(
+                f"{source} has {field}={actual!r}; expected {expected!r}."
+            )
 
 
 def letterbox(
@@ -300,8 +415,16 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("SAM 3 real batch inference requires a CUDA GPU.")
 
+    identity = (
+        resolve_real_object(args.object_name, args.objects_metadata)
+        if args.objects_metadata is not None
+        else None
+    )
+    object_name = identity.applied_key if identity is not None else args.object_name
     reference_path, annotation = load_reference_annotation(
-        args.object_name, args.reference_index
+        object_name,
+        args.reference_index,
+        expected_identity=identity,
     )
     if annotation.get("bbox_format") != "xyxy":
         raise ValueError("The pilot implementation requires bbox_format='xyxy'.")
@@ -315,7 +438,10 @@ def main() -> None:
         )
 
     image_paths = load_target_image_paths(
-        args.object_name, args.image_dir, args.scene_meta
+        object_name,
+        args.image_dir,
+        args.scene_meta,
+        expected_identity=identity,
     )
 
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -344,13 +470,16 @@ def main() -> None:
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
     summary = {
-        "object_name": args.object_name,
+        "object_name": object_name,
         "reference_image": str(reference_path),
         "reference_bbox_xyxy": reference_box,
         "input_size": args.input_size,
         "confidence_threshold": args.confidence_threshold,
         "images": [],
     }
+    if identity is not None:
+        summary.update(identity.metadata())
+        summary["requested_object_name"] = args.object_name
 
     for target_path in image_paths:
         target = load_oriented_rgb(target_path)

@@ -8,11 +8,13 @@ from PIL import Image
 from examples.cross_image_exemplar_real import (
     letterbox,
     load_oriented_rgb,
+    load_reference_annotation,
     load_target_image_paths,
     map_box_to_canvas,
     map_boxes_to_original,
     restore_masks,
 )
+from examples.real_object_catalog import RealObjectIdentity
 
 
 @pytest.mark.parametrize("image_size", [(1000, 1000), (1600, 900), (900, 1600)])
@@ -98,3 +100,162 @@ def test_target_images_are_selected_from_manifest(tmp_path):
         "wire_tracker", image_dir=image_dir, scene_meta_path=manifest_path
     )
     assert [path.name for path in selected] == ["selected_b.jpg", "selected_a.png"]
+
+
+def _paper_cup_identity() -> RealObjectIdentity:
+    return RealObjectIdentity(
+        applied_key="paper_cup",
+        object_id="obj_120",
+        catalog_object_name="disposable_paper_cup",
+        old_name="paper_cup",
+        key_namespace="Old_name",
+        catalog_year=2025,
+        object_catalog_sha256="abc123",
+        matched_field="Old_name",
+    )
+
+
+def test_catalog_identity_joins_reference_bbox_and_capture_manifest(tmp_path):
+    identity = _paper_cup_identity()
+    identity_metadata = identity.metadata()
+    reference_dir = tmp_path / "reference"
+    reference_dir.mkdir()
+    reference_image = reference_dir / "paper_cup.png"
+    Image.new("RGB", (10, 10)).save(reference_image)
+    annotation_path = reference_dir / "paper_cup.json"
+    annotation_path.write_text(
+        json.dumps(
+            {
+                **identity_metadata,
+                "bbox_format": "xyxy",
+                "bbox": [1, 1, 9, 9],
+            }
+        ),
+        encoding="utf-8",
+    )
+    index_path = reference_dir / "reference_index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "objects": {
+                    "paper_cup": {
+                        **identity_metadata,
+                        "reference_image": "paper_cup.png",
+                        "bbox_annotation": "paper_cup.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    image_dir = tmp_path / "rgb"
+    image_dir.mkdir()
+    Image.new("RGB", (10, 10)).save(image_dir / "0000.png")
+    manifest_path = tmp_path / "capture_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "object_catalog": {"sha256": identity.object_catalog_sha256},
+                "objects": {
+                    "paper_cup": {
+                        **identity_metadata,
+                        "images": ["0000.png"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    loaded_reference, annotation = load_reference_annotation(
+        "paper_cup", index_path, expected_identity=identity
+    )
+    targets = load_target_image_paths(
+        "paper_cup",
+        image_dir,
+        manifest_path,
+        expected_identity=identity,
+    )
+
+    assert loaded_reference == reference_image.resolve()
+    assert annotation["object_id"] == "obj_120"
+    assert targets == [(image_dir / "0000.png").resolve()]
+
+
+def test_catalog_mode_rejects_reference_or_manifest_identity_drift(tmp_path):
+    identity = _paper_cup_identity()
+    reference_image = tmp_path / "reference.png"
+    reference_image.write_bytes(b"image")
+    annotation_path = tmp_path / "reference.json"
+    annotation_path.write_text(
+        json.dumps({**identity.metadata(), "object_id": "obj_999"}),
+        encoding="utf-8",
+    )
+    index_path = tmp_path / "reference_index.json"
+    index_path.write_text(
+        json.dumps(
+            {
+                "objects": {
+                    "paper_cup": {
+                        **identity.metadata(),
+                        "reference_image": "reference.png",
+                        "bbox_annotation": "reference.json",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="object_id='obj_999'"):
+        load_reference_annotation(
+            "paper_cup", index_path, expected_identity=identity
+        )
+
+    image_dir = tmp_path / "rgb"
+    image_dir.mkdir()
+    Image.new("RGB", (10, 10)).save(image_dir / "0000.png")
+    manifest_path = tmp_path / "capture_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "object_catalog": {"sha256": "different"},
+                "objects": {
+                    "paper_cup": {
+                        **identity.metadata(),
+                        "images": ["0000.png"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="SHA-256"):
+        load_target_image_paths(
+            "paper_cup",
+            image_dir,
+            manifest_path,
+            expected_identity=identity,
+        )
+
+
+def test_target_image_cannot_escape_image_directory(tmp_path):
+    image_dir = tmp_path / "rgb"
+    image_dir.mkdir()
+    Image.new("RGB", (10, 10)).save(tmp_path / "outside.png")
+    manifest_path = tmp_path / "capture_manifest.json"
+    manifest_path.write_text(
+        json.dumps(
+            {
+                "objects": {
+                    "paper_cup": {"images": ["../outside.png"]},
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="relative to --image-dir"):
+        load_target_image_paths("paper_cup", image_dir, manifest_path)
