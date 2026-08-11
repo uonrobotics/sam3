@@ -9,9 +9,17 @@ reference BBox를 동일 canvas의 positive geometric prompt로 제공한다.
 from __future__ import annotations
 
 import argparse
+from datetime import datetime, timezone
+import hashlib
+from io import BytesIO
 import json
+import math
+import os
 from dataclasses import dataclass
 from pathlib import Path
+import re
+from typing import Sequence
+from uuid import uuid4
 
 import numpy as np
 import torch
@@ -29,6 +37,9 @@ else:  # pragma: no cover - exercised by direct CLI execution
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+BACKGROUND_RGBA = (0, 0, 0, 0)
+UNLABELLED_RGBA = (0, 0, 0, 255)
+TARGET_RGBA = (255, 25, 25, 255)
 
 
 @dataclass(frozen=True)
@@ -42,11 +53,39 @@ class LetterboxTransform:
     original_height: int
 
 
-def parse_args() -> argparse.Namespace:
+@dataclass(frozen=True)
+class DatasetModePaths:
+    root: Path
+    camera_name: str
+    image_dir: Path
+    reference_index: Path
+    capture_manifest: Path
+    bbox_dir: Path
+    inst_seg_dir: Path
+    diagnostics_object_dir: Path
+    summary_path: Path
+
+
+def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Batch SAM 3 inference using a stitched real-image exemplar."
     )
     parser.add_argument("--object-name", required=True)
+    parser.add_argument(
+        "--dataset-root",
+        type=Path,
+        help=(
+            "Enable the canonical Gemini dataset mode. Inputs are read from "
+            "<root>/capture_manifest.json, <root>/reference/reference_index.json, "
+            "and <root>/rgb/<camera-name>; canonical outputs are written beneath "
+            "the same dataset root. Explicit legacy path arguments are ignored."
+        ),
+    )
+    parser.add_argument(
+        "--camera-name",
+        default="top_view_camera",
+        help="Camera key used by dataset-mode images_by_camera and output paths.",
+    )
     parser.add_argument(
         "--objects-metadata",
         type=Path,
@@ -85,7 +124,63 @@ def parse_args() -> argparse.Namespace:
         help="공식 image notebook과 같은 기본 confidence threshold.",
     )
     parser.add_argument("--checkpoint", type=Path)
-    return parser.parse_args()
+    parser.add_argument(
+        "--save-diagnostics",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Write dataset-mode overlay and stitched prompt diagnostics "
+            "(default: enabled)."
+        ),
+    )
+    return parser.parse_args(argv)
+
+
+def dataset_mode_paths(
+    dataset_root: Path,
+    camera_name: str,
+    object_name: str,
+) -> DatasetModePaths:
+    """Resolve the fixed Gemini dataset-mode input and output contract."""
+
+    root = dataset_root.expanduser().resolve()
+    camera_component = _safe_path_component(camera_name, "camera name")
+    object_component = _safe_path_component(object_name, "object name")
+    return DatasetModePaths(
+        root=root,
+        camera_name=camera_component,
+        image_dir=root / "rgb" / camera_component,
+        reference_index=root / "reference" / "reference_index.json",
+        capture_manifest=root / "capture_manifest.json",
+        bbox_dir=root / "bbox" / camera_component,
+        inst_seg_dir=root / "inst_seg" / camera_component,
+        diagnostics_object_dir=(
+            root / "diagnostics" / "sam3" / camera_component / object_component
+        ),
+        summary_path=(
+            root
+            / "inference_meta"
+            / "sam3"
+            / camera_component
+            / object_component
+            / "summary.json"
+        ),
+    )
+
+
+def _safe_path_component(value: str, description: str) -> str:
+    if (
+        not isinstance(value, str)
+        or not value
+        or value != value.strip()
+        or value in {".", ".."}
+        or "/" in value
+        or "\\" in value
+        or "\x00" in value
+        or Path(value).is_absolute()
+    ):
+        raise ValueError(f"Unsafe {description}: {value!r}")
+    return value
 
 
 def load_oriented_rgb(path: Path) -> Image.Image:
@@ -166,6 +261,7 @@ def load_target_image_paths(
     scene_meta_path: Path,
     *,
     expected_identity: RealObjectIdentity | None = None,
+    camera_name: str | None = None,
 ) -> list[Path]:
     """수집 metadata에서 해당 객체로 등록된 target 이미지만 반환한다."""
     if not scene_meta_path.is_file():
@@ -207,12 +303,44 @@ def load_target_image_paths(
             expected_identity,
             source=f"capture manifest {scene_meta_path}",
         )
-    image_names = entry.get("images", [])
-    if not isinstance(image_names, list) or not image_names:
-        raise ValueError(f"No target images registered for {object_name!r}")
+    image_names: object
+    used_legacy_images = True
+    images_by_camera = entry.get("images_by_camera")
+    if camera_name is not None and images_by_camera is not None:
+        if not isinstance(images_by_camera, dict):
+            raise ValueError(f"images_by_camera for {object_name!r} must be an object.")
+        if camera_name in images_by_camera:
+            image_names = images_by_camera[camera_name]
+            used_legacy_images = False
+        else:
+            image_names = entry.get("images", [])
+    else:
+        image_names = entry.get("images", [])
+    if not isinstance(image_names, list):
+        raise ValueError(f"Target images for {object_name!r} must be a list.")
     if not all(isinstance(name, str) and name for name in image_names):
         raise ValueError(
             f"Target image names for {object_name!r} must be non-empty strings."
+        )
+    if camera_name is not None and used_legacy_images:
+        camera_relative_names: list[str] = []
+        for image_name in image_names:
+            relative_path = Path(image_name)
+            if relative_path.is_absolute() or ".." in relative_path.parts:
+                raise ValueError(
+                    f"Target image must be relative to --image-dir: {image_name!r}"
+                )
+            if len(relative_path.parts) == 1:
+                camera_relative_names.append(image_name)
+            elif relative_path.parts[0] == camera_name:
+                camera_relative_names.append(Path(*relative_path.parts[1:]).as_posix())
+        image_names = camera_relative_names
+    if not image_names:
+        camera_suffix = (
+            f" and camera {camera_name!r}" if camera_name is not None else ""
+        )
+        raise ValueError(
+            f"No target images registered for {object_name!r}{camera_suffix}"
         )
     if len(image_names) != len(set(image_names)):
         raise ValueError(f"Duplicate target image names for {object_name!r}")
@@ -240,6 +368,27 @@ def load_target_image_paths(
     return image_paths
 
 
+def load_manifest_object_entry(
+    object_name: str,
+    scene_meta_path: Path,
+) -> dict:
+    """Return one manifest object entry for dataset output identity metadata."""
+
+    if not scene_meta_path.is_file():
+        raise FileNotFoundError(f"Capture manifest not found: {scene_meta_path}")
+    manifest = json.loads(scene_meta_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict) or not isinstance(manifest.get("objects"), dict):
+        raise ValueError(
+            f"Capture manifest must contain an objects mapping: {scene_meta_path}"
+        )
+    entry = manifest["objects"].get(object_name)
+    if not isinstance(entry, dict):
+        raise KeyError(
+            f"Object {object_name!r} not found in capture manifest {scene_meta_path}"
+        )
+    return entry
+
+
 def _validate_identity_metadata(
     document: dict,
     identity: RealObjectIdentity,
@@ -250,14 +399,10 @@ def _validate_identity_metadata(
 
     for field, expected in identity.metadata().items():
         if field not in document:
-            raise ValueError(
-                f"{source} is missing catalog identity field {field!r}."
-            )
+            raise ValueError(f"{source} is missing catalog identity field {field!r}.")
         actual = document[field]
         if actual != expected:
-            raise ValueError(
-                f"{source} has {field}={actual!r}; expected {expected!r}."
-            )
+            raise ValueError(f"{source} has {field}={actual!r}; expected {expected!r}.")
 
 
 def letterbox(
@@ -302,18 +447,12 @@ def map_boxes_to_original(
     boxes: torch.Tensor, transform: LetterboxTransform, tile_y: int
 ) -> torch.Tensor:
     restored = boxes.clone()
-    restored[:, [0, 2]] = (
-        restored[:, [0, 2]] - transform.offset_x
-    ) / transform.scale
+    restored[:, [0, 2]] = (restored[:, [0, 2]] - transform.offset_x) / transform.scale
     restored[:, [1, 3]] = (
         restored[:, [1, 3]] - tile_y - transform.offset_y
     ) / transform.scale
-    restored[:, [0, 2]] = restored[:, [0, 2]].clamp(
-        0, transform.original_width
-    )
-    restored[:, [1, 3]] = restored[:, [1, 3]].clamp(
-        0, transform.original_height
-    )
+    restored[:, [0, 2]] = restored[:, [0, 2]].clamp(0, transform.original_width)
+    restored[:, [1, 3]] = restored[:, [1, 3]].clamp(0, transform.original_height)
     return restored
 
 
@@ -398,6 +537,334 @@ def save_results(
     return records
 
 
+def save_dataset_results(
+    target: Image.Image,
+    masks: list[np.ndarray],
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    paths: DatasetModePaths,
+    frame_stem: str,
+    object_name: str,
+    object_id: str,
+    source_image: Path,
+    prompt_preview: Image.Image | None,
+    save_diagnostics: bool,
+) -> dict:
+    """Publish one frame in the canonical Gemini dataset output layout."""
+
+    frame_component = _safe_path_component(frame_stem, "frame stem")
+    _safe_path_component(object_name, "object name")
+    if re.fullmatch(r"obj_\d{3}", object_id) is None:
+        raise ValueError(
+            f"Dataset-mode object_id must match 'obj_NNN', got {object_id!r}."
+        )
+    if save_diagnostics and prompt_preview is None:
+        raise ValueError(
+            "prompt_preview is required when dataset diagnostics are enabled."
+        )
+    width, height = target.size
+    candidates = _dataset_prediction_records(
+        masks,
+        boxes,
+        scores,
+        width=width,
+        height=height,
+    )
+    selected_index = (
+        int(torch.argmax(scores).detach().cpu()) if len(candidates) else None
+    )
+    for candidate in candidates:
+        candidate["selected"] = candidate["index"] == selected_index
+
+    bbox_path = paths.bbox_dir / f"{frame_component}.json"
+    inst_seg_path = paths.inst_seg_dir / f"{frame_component}.png"
+    mapping_path = paths.inst_seg_dir / f"semantics_mapping_{frame_component}.json"
+    rgba = np.empty((height, width, 4), dtype=np.uint8)
+    rgba[:, :] = UNLABELLED_RGBA
+    bbox_document: dict[str, list[int]] = {}
+    if selected_index is not None:
+        selected_mask = np.asarray(masks[selected_index], dtype=bool)
+        rgba[selected_mask] = TARGET_RGBA
+        bbox_document[object_id] = candidates[selected_index]["bbox_xyxy"]
+
+    mapping_document = {
+        str(BACKGROUND_RGBA): {"class": "BACKGROUND"},
+        str(UNLABELLED_RGBA): {"class": "UNLABELLED"},
+        str(TARGET_RGBA): {"class": object_id},
+    }
+    overlay: Image.Image | None = None
+    if save_diagnostics:
+        overlay = _render_dataset_overlay(target, masks, candidates)
+
+    _atomic_write_json(bbox_path, bbox_document)
+    _atomic_save_image(Image.fromarray(rgba, mode="RGBA"), inst_seg_path, "PNG")
+    _atomic_write_json(mapping_path, mapping_document)
+
+    diagnostic_paths: dict[str, str] = {}
+    if save_diagnostics:
+        assert prompt_preview is not None  # validated before publishing artifacts
+        assert overlay is not None
+        diagnostic_dir = paths.diagnostics_object_dir / frame_component
+        overlay_path = diagnostic_dir / "overlay.jpg"
+        stitched_path = diagnostic_dir / "stitched_prompt.jpg"
+        _atomic_save_image(overlay, overlay_path, "JPEG", quality=95)
+        _atomic_save_image(
+            prompt_preview.convert("RGB"), stitched_path, "JPEG", quality=92
+        )
+        diagnostic_paths = {
+            "overlay": _dataset_relative_path(overlay_path, paths.root),
+            "stitched_prompt": _dataset_relative_path(stitched_path, paths.root),
+        }
+
+    return {
+        "frame_id": frame_component,
+        "image": _dataset_relative_path(source_image, paths.root),
+        "image_sha256": _sha256_file(source_image),
+        "image_width": width,
+        "image_height": height,
+        "status": "ok" if selected_index is not None else "no_predictions",
+        "prediction_count": len(candidates),
+        "selected_prediction_index": selected_index,
+        "predictions": candidates,
+        "artifacts": {
+            "bbox": _dataset_relative_path(bbox_path, paths.root),
+            "inst_seg": _dataset_relative_path(inst_seg_path, paths.root),
+            "semantics_mapping": _dataset_relative_path(mapping_path, paths.root),
+            **diagnostic_paths,
+        },
+    }
+
+
+def _dataset_prediction_records(
+    masks: list[np.ndarray],
+    boxes: torch.Tensor,
+    scores: torch.Tensor,
+    *,
+    width: int,
+    height: int,
+) -> list[dict]:
+    if boxes.ndim != 2 or boxes.shape[1:] != (4,):
+        raise ValueError(f"Prediction boxes must have shape Nx4, got {boxes.shape}.")
+    if scores.ndim != 1:
+        raise ValueError(f"Prediction scores must have shape N, got {scores.shape}.")
+    if len(masks) != len(boxes) or len(boxes) != len(scores):
+        raise ValueError(
+            "Prediction masks, boxes, and scores must have the same length."
+        )
+
+    records: list[dict] = []
+    for index, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
+        mask_array = np.asarray(mask, dtype=bool)
+        if mask_array.shape != (height, width):
+            raise ValueError(
+                f"Prediction mask {index} has shape {mask_array.shape}; "
+                f"expected {(height, width)}."
+            )
+        model_bbox = [float(value) for value in box.detach().cpu().tolist()]
+        records.append(
+            {
+                "index": index,
+                "score": float(score.detach().cpu()),
+                "bbox_xyxy": _virtual_compatible_bbox(
+                    model_bbox, width=width, height=height
+                ),
+                "model_bbox_xyxy": model_bbox,
+                "mask_pixel_count": int(mask_array.sum()),
+            }
+        )
+    return records
+
+
+def _virtual_compatible_bbox(
+    bbox: list[float],
+    *,
+    width: int,
+    height: int,
+) -> list[int]:
+    x1, y1, x2, y2 = bbox
+    return [
+        max(0, min(width, math.floor(x1))),
+        max(0, min(height, math.floor(y1))),
+        max(0, min(width, math.ceil(x2))),
+        max(0, min(height, math.ceil(y2))),
+    ]
+
+
+def _render_dataset_overlay(
+    target: Image.Image,
+    masks: list[np.ndarray],
+    records: list[dict],
+) -> Image.Image:
+    overlay_image = target.convert("RGBA")
+    colors = [(0, 255, 255), (255, 0, 255), (50, 120, 255), (48, 220, 80)]
+    for mask, record in zip(masks, records):
+        mask_image = Image.fromarray(np.asarray(mask, dtype=np.uint8) * 255, mode="L")
+        color = colors[record["index"] % len(colors)]
+        color_layer = Image.new("RGBA", target.size, (*color, 0))
+        color_layer.putalpha(mask_image.point(lambda value: 100 if value else 0))
+        overlay_image = Image.alpha_composite(overlay_image, color_layer)
+
+    draw = ImageDraw.Draw(overlay_image)
+    for record in records:
+        color = colors[record["index"] % len(colors)]
+        box = record["model_bbox_xyxy"]
+        draw.rectangle(box, outline=(*color, 255), width=4)
+        draw.text(
+            (box[0], max(0, box[1] - 18)),
+            f"(id={record['index']}, prob={record['score']:.2f})",
+            fill=(*color, 255),
+            stroke_width=2,
+            stroke_fill=(255, 255, 255, 255),
+        )
+    return overlay_image.convert("RGB")
+
+
+def _atomic_write_json(path: Path, document: object) -> None:
+    payload = (json.dumps(document, indent=2) + "\n").encode("utf-8")
+    _atomic_write_bytes(path, payload)
+
+
+def _atomic_save_image(
+    image: Image.Image,
+    path: Path,
+    image_format: str,
+    **save_kwargs,
+) -> None:
+    stream = BytesIO()
+    image.save(stream, format=image_format, **save_kwargs)
+    _atomic_write_bytes(path, stream.getvalue())
+
+
+def _atomic_write_bytes(path: Path, payload: bytes) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary_path = path.parent / f".{path.name}.{uuid4().hex}.tmp"
+    try:
+        descriptor = os.open(
+            temporary_path,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL,
+            0o664,
+        )
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(payload)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temporary_path, path)
+        _fsync_directory(path.parent)
+    finally:
+        temporary_path.unlink(missing_ok=True)
+
+
+def _fsync_directory(directory: Path) -> None:
+    descriptor = os.open(
+        directory,
+        os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+    )
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _dataset_relative_path(path: Path, dataset_root: Path) -> str:
+    try:
+        return path.resolve().relative_to(dataset_root.resolve()).as_posix()
+    except ValueError as exc:
+        raise ValueError(f"Dataset artifact path escapes dataset root: {path}") from exc
+
+
+def build_dataset_summary(
+    *,
+    paths: DatasetModePaths,
+    object_name: str,
+    object_id: str,
+    requested_object_name: str,
+    identity: RealObjectIdentity | None,
+    manifest_entry: dict,
+    reference_path: Path,
+    reference_box: list[float],
+    input_size: int,
+    confidence_threshold: float,
+    checkpoint: Path | None,
+    save_diagnostics: bool,
+) -> dict:
+    """Create run-level provenance; frame results are appended by the caller."""
+
+    summary: dict = {
+        "schema_version": "1.0",
+        "artifact_type": "sam3_real_pcs_summary",
+        "status": "running",
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+        "mode": "dataset",
+        "camera_name": paths.camera_name,
+        "object_name": object_name,
+        "object_id": object_id,
+        "requested_object_name": requested_object_name,
+        "reference_image": _dataset_relative_path(reference_path, paths.root),
+        "reference_bbox_xyxy": reference_box,
+        "input_size": input_size,
+        "confidence_threshold": confidence_threshold,
+        "checkpoint": str(checkpoint.expanduser().resolve()) if checkpoint else None,
+        "save_diagnostics": save_diagnostics,
+        "output_contract": {
+            "selection_policy": "highest_score_single_manipulation_target",
+            "bbox_format": "xyxy_integer_half_open_covering_box",
+            "inst_seg_mode": "rgba_uint8",
+            "target_rgba": list(TARGET_RGBA),
+            "unlabelled_rgba": list(UNLABELLED_RGBA),
+        },
+        "provenance": {
+            "capture_manifest": _dataset_relative_path(
+                paths.capture_manifest, paths.root
+            ),
+            "capture_manifest_sha256": _sha256_file(paths.capture_manifest),
+            "reference_index": _dataset_relative_path(
+                paths.reference_index, paths.root
+            ),
+            "reference_index_sha256": _sha256_file(paths.reference_index),
+            "image_directory": _dataset_relative_path(paths.image_dir, paths.root),
+        },
+        "images": [],
+    }
+    if identity is not None:
+        summary.update(identity.metadata())
+    else:
+        for field in (
+            "old_name",
+            "catalog_object_name",
+            "key_namespace",
+            "catalog_year",
+            "object_catalog_sha256",
+        ):
+            if field in manifest_entry:
+                summary[field] = manifest_entry[field]
+    return summary
+
+
+def finalize_dataset_summary(paths: DatasetModePaths, summary: dict) -> None:
+    """Write the run summary last so it acts as the completed-run marker."""
+
+    images = summary.get("images", [])
+    summary["status"] = "complete"
+    summary["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
+    summary["frame_count"] = len(images)
+    summary["frames_with_predictions"] = sum(
+        item.get("status") == "ok" for item in images
+    )
+    summary["frames_without_predictions"] = sum(
+        item.get("status") == "no_predictions" for item in images
+    )
+    _atomic_write_json(paths.summary_path, summary)
+
+
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def clear_previous_results(output_dir: Path) -> None:
     """재실행 시 해당 target의 과거 생성물만 제거한다."""
     for mask_path in output_dir.glob("mask_*.png"):
@@ -421,9 +888,19 @@ def main() -> None:
         else None
     )
     object_name = identity.applied_key if identity is not None else args.object_name
+    dataset_paths = (
+        dataset_mode_paths(args.dataset_root, args.camera_name, object_name)
+        if args.dataset_root is not None
+        else None
+    )
+    image_dir = dataset_paths.image_dir if dataset_paths else args.image_dir
+    reference_index = (
+        dataset_paths.reference_index if dataset_paths else args.reference_index
+    )
+    scene_meta = dataset_paths.capture_manifest if dataset_paths else args.scene_meta
     reference_path, annotation = load_reference_annotation(
         object_name,
-        args.reference_index,
+        reference_index,
         expected_identity=identity,
     )
     if annotation.get("bbox_format") != "xyxy":
@@ -439,10 +916,25 @@ def main() -> None:
 
     image_paths = load_target_image_paths(
         object_name,
-        args.image_dir,
-        args.scene_meta,
+        image_dir,
+        scene_meta,
         expected_identity=identity,
+        camera_name=dataset_paths.camera_name if dataset_paths else None,
     )
+    manifest_entry = (
+        load_manifest_object_entry(object_name, scene_meta)
+        if dataset_paths is not None
+        else None
+    )
+    object_id = (
+        identity.object_id
+        if identity is not None
+        else manifest_entry.get("object_id") if manifest_entry is not None else None
+    )
+    if dataset_paths is not None and not isinstance(object_id, str):
+        raise ValueError(
+            f"Dataset-mode manifest object {object_name!r} has no object_id."
+        )
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -458,28 +950,46 @@ def main() -> None:
 
     tile_width = args.input_size
     tile_height = args.input_size // 2
-    reference_tile, reference_transform = letterbox(
-        reference, tile_width, tile_height
-    )
+    reference_tile, reference_transform = letterbox(reference, tile_width, tile_height)
     prompt_box = map_box_to_canvas(reference_box, reference_transform, tile_y=0)
-    normalized_prompt = normalize_bbox(
-        box_xyxy_to_cxcywh(torch.tensor(prompt_box).view(1, 4)),
-        args.input_size,
-        args.input_size,
-    ).flatten().tolist()
+    normalized_prompt = (
+        normalize_bbox(
+            box_xyxy_to_cxcywh(torch.tensor(prompt_box).view(1, 4)),
+            args.input_size,
+            args.input_size,
+        )
+        .flatten()
+        .tolist()
+    )
 
-    args.output_dir.mkdir(parents=True, exist_ok=True)
-    summary = {
-        "object_name": object_name,
-        "reference_image": str(reference_path),
-        "reference_bbox_xyxy": reference_box,
-        "input_size": args.input_size,
-        "confidence_threshold": args.confidence_threshold,
-        "images": [],
-    }
-    if identity is not None:
-        summary.update(identity.metadata())
-        summary["requested_object_name"] = args.object_name
+    if dataset_paths is not None:
+        summary = build_dataset_summary(
+            paths=dataset_paths,
+            object_name=object_name,
+            object_id=object_id,
+            requested_object_name=args.object_name,
+            identity=identity,
+            manifest_entry=manifest_entry,
+            reference_path=reference_path,
+            reference_box=reference_box,
+            input_size=args.input_size,
+            confidence_threshold=args.confidence_threshold,
+            checkpoint=args.checkpoint,
+            save_diagnostics=args.save_diagnostics,
+        )
+    else:
+        args.output_dir.mkdir(parents=True, exist_ok=True)
+        summary = {
+            "object_name": object_name,
+            "reference_image": str(reference_path),
+            "reference_bbox_xyxy": reference_box,
+            "input_size": args.input_size,
+            "confidence_threshold": args.confidence_threshold,
+            "images": [],
+        }
+        if identity is not None:
+            summary.update(identity.metadata())
+            summary["requested_object_name"] = args.object_name
 
     for target_path in image_paths:
         target = load_oriented_rgb(target_path)
@@ -488,12 +998,21 @@ def main() -> None:
         canvas.paste(reference_tile, (0, 0))
         canvas.paste(target_tile, (0, tile_height))
 
-        target_output_dir = args.output_dir / target_path.stem
-        target_output_dir.mkdir(parents=True, exist_ok=True)
-        clear_previous_results(target_output_dir)
-        prompt_preview = canvas.copy()
-        ImageDraw.Draw(prompt_preview).rectangle(prompt_box, outline=(0, 255, 0), width=4)
-        prompt_preview.save(target_output_dir / "stitched_prompt.jpg", quality=92)
+        prompt_preview = None
+        if dataset_paths is None:
+            target_output_dir = args.output_dir / target_path.stem
+            target_output_dir.mkdir(parents=True, exist_ok=True)
+            clear_previous_results(target_output_dir)
+            prompt_preview = canvas.copy()
+            ImageDraw.Draw(prompt_preview).rectangle(
+                prompt_box, outline=(0, 255, 0), width=4
+            )
+            prompt_preview.save(target_output_dir / "stitched_prompt.jpg", quality=92)
+        elif args.save_diagnostics:
+            prompt_preview = canvas.copy()
+            ImageDraw.Draw(prompt_preview).rectangle(
+                prompt_box, outline=(0, 255, 0), width=4
+            )
 
         with torch.inference_mode(), torch.autocast(
             device_type="cuda", dtype=torch.bfloat16
@@ -520,22 +1039,44 @@ def main() -> None:
             args.input_size,
         )
         target_scores = scores[keep_target]
-        records = save_results(
-            target, target_masks, target_boxes, target_scores, target_output_dir
-        )
-        summary["images"].append(
-            {
-                "image": target_path.name,
-                "prediction_count": len(records),
-                "predictions": records,
-            }
-        )
-        print(f"{target_path.name}: {len(records)} prediction(s)")
+        if dataset_paths is not None:
+            frame_result = save_dataset_results(
+                target,
+                target_masks,
+                target_boxes,
+                target_scores,
+                paths=dataset_paths,
+                frame_stem=target_path.stem,
+                object_name=object_name,
+                object_id=object_id,
+                source_image=target_path,
+                prompt_preview=prompt_preview,
+                save_diagnostics=args.save_diagnostics,
+            )
+            summary["images"].append(frame_result)
+            prediction_count = frame_result["prediction_count"]
+        else:
+            records = save_results(
+                target, target_masks, target_boxes, target_scores, target_output_dir
+            )
+            summary["images"].append(
+                {
+                    "image": target_path.name,
+                    "prediction_count": len(records),
+                    "predictions": records,
+                }
+            )
+            prediction_count = len(records)
+        print(f"{target_path.name}: {prediction_count} prediction(s)")
 
-    (args.output_dir / "summary.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf-8"
-    )
-    print(f"Saved batch results to {args.output_dir}")
+    if dataset_paths is not None:
+        finalize_dataset_summary(dataset_paths, summary)
+        print(f"Saved canonical dataset results to {dataset_paths.root}")
+    else:
+        (args.output_dir / "summary.json").write_text(
+            json.dumps(summary, indent=2), encoding="utf-8"
+        )
+        print(f"Saved batch results to {args.output_dir}")
 
 
 if __name__ == "__main__":
