@@ -595,7 +595,14 @@ def save_dataset_results(
     }
     overlay: Image.Image | None = None
     if save_diagnostics:
-        overlay = _render_dataset_overlay(target, masks, candidates)
+        # Diagnostics mirrors inst_seg/bbox: draw only the selected
+        # (highest-score) prediction, not every raw candidate in the target
+        # region.
+        selected_masks = [masks[selected_index]] if selected_index is not None else []
+        selected_candidates = (
+            [candidates[selected_index]] if selected_index is not None else []
+        )
+        overlay = _render_dataset_overlay(target, selected_masks, selected_candidates)
 
     _atomic_write_json(bbox_path, bbox_document)
     _atomic_save_image(Image.fromarray(rgba, mode="RGBA"), inst_seg_path, "PNG")

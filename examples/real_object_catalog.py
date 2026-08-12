@@ -189,10 +189,10 @@ def _load_rows(text: str, source_path: Path) -> list[_CatalogRow]:
                     f"Objects metadata row {source_line} has non-integer "
                     f"Year={values['Year']!r}."
                 ) from exc
-            if catalog_year not in {2024, 2025}:
+            if catalog_year not in {2024, 2025, 2026}:
                 raise RealObjectCatalogError(
                     f"Objects metadata row {source_line} has Year={catalog_year}; "
-                    "expected 2024 or 2025."
+                    "expected 2024, 2025, or 2026."
                 )
             rows.append(
                 _CatalogRow(

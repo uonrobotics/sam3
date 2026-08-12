@@ -496,6 +496,59 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_pat
     assert written_summary["images"][0]["predictions"][0]["score"] == pytest.approx(0.6)
 
 
+def test_dataset_mode_overlay_draws_only_the_selected_prediction(tmp_path):
+    """diagnostics/overlay must match inst_seg: only the highest-score
+    candidate is drawn, not every raw detection in the target region."""
+
+    paths = dataset_mode_paths(tmp_path, "top_view_camera", "paper_cup")
+    paths.image_dir.mkdir(parents=True)
+    source_image = paths.image_dir / "0007.png"
+    background = (20, 30, 40)
+    # Large enough, and with the two regions far enough apart, that JPEG's
+    # block-based compression can't bleed one region's color into the other.
+    target = Image.new("RGB", (64, 64), background)
+    target.save(source_image)
+    unselected_mask = np.zeros((64, 64), dtype=bool)
+    unselected_mask[0:8, 0:8] = True  # region unique to the losing candidate
+    selected_mask = np.zeros((64, 64), dtype=bool)
+    selected_mask[48:56, 48:56] = True  # region unique to the winning candidate
+
+    frame_result = save_dataset_results(
+        target,
+        [unselected_mask, selected_mask],
+        torch.tensor(
+            [[0.0, 0.0, 8.0, 8.0], [48.0, 48.0, 56.0, 56.0]], dtype=torch.float32
+        ),
+        torch.tensor([0.1, 0.9], dtype=torch.float32),
+        paths=paths,
+        frame_stem="0007",
+        object_name="paper_cup",
+        object_id="obj_120",
+        source_image=source_image,
+        prompt_preview=Image.new("RGB", (8, 8), (0, 0, 0)),
+        save_diagnostics=True,
+    )
+
+    assert frame_result["selected_prediction_index"] == 1
+    overlay_path = (
+        tmp_path
+        / "diagnostics"
+        / "sam3"
+        / "top_view_camera"
+        / "paper_cup"
+        / "0007"
+        / "overlay.jpg"
+    )
+    with Image.open(overlay_path) as opened:
+        overlay = np.asarray(opened.convert("RGB")).astype(int)
+    # The losing candidate's region must be left close to the plain
+    # background color; the winning candidate's region must be clearly
+    # tinted away from it. A loose tolerance absorbs JPEG lossy compression
+    # without hiding an actual (much larger) color shift.
+    assert np.allclose(overlay[2, 2], background, atol=12)
+    assert not np.allclose(overlay[52, 52], background, atol=30)
+
+
 def test_dataset_mode_no_predictions_writes_unlabelled_mask_without_diagnostics(
     tmp_path,
 ):
