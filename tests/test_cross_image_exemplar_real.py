@@ -21,7 +21,6 @@ from examples.cross_image_exemplar_real import (
     parse_args,
     restore_masks,
     save_dataset_results,
-    save_results,
 )
 from examples.real_object_catalog import RealObjectIdentity
 
@@ -122,29 +121,6 @@ def test_dataset_diagnostics_boolean_option_defaults_on_and_can_be_disabled():
     assert enabled.camera_name == "top_view_camera"
     assert enabled.save_diagnostics is True
     assert disabled.save_diagnostics is False
-
-
-def test_legacy_explicit_path_arguments_remain_available(tmp_path):
-    args = parse_args(
-        [
-            "--object-name",
-            "paper_cup",
-            "--image-dir",
-            str(tmp_path / "rgb"),
-            "--reference-index",
-            str(tmp_path / "reference_index.json"),
-            "--scene-meta",
-            str(tmp_path / "capture_manifest.json"),
-            "--output-dir",
-            str(tmp_path / "output"),
-        ]
-    )
-
-    assert args.dataset_root is None
-    assert args.image_dir == tmp_path / "rgb"
-    assert args.reference_index == tmp_path / "reference_index.json"
-    assert args.scene_meta == tmp_path / "capture_manifest.json"
-    assert args.output_dir == tmp_path / "output"
 
 
 def test_target_images_prefer_requested_camera_then_fall_back_to_legacy(tmp_path):
@@ -592,22 +568,3 @@ def test_dataset_mode_no_predictions_writes_unlabelled_mask_without_diagnostics(
     assert "overlay" not in result["artifacts"]
     assert not (tmp_path / "diagnostics").exists()
     assert not list(tmp_path.rglob("mask_*.png"))
-
-
-def test_legacy_result_writer_keeps_individual_mask_layout(tmp_path):
-    target = Image.new("RGB", (5, 4), (0, 0, 0))
-    mask = np.zeros((4, 5), dtype=bool)
-    mask[1:3, 2:4] = True
-
-    records = save_results(
-        target,
-        [mask],
-        torch.tensor([[2.0, 1.0, 4.0, 3.0]]),
-        torch.tensor([0.75]),
-        tmp_path,
-    )
-
-    assert records[0]["score"] == pytest.approx(0.75)
-    assert (tmp_path / "mask_000.png").is_file()
-    assert (tmp_path / "overlay.jpg").is_file()
-    assert (tmp_path / "predictions.json").is_file()

@@ -74,11 +74,12 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser.add_argument(
         "--dataset-root",
         type=Path,
+        required=True,
         help=(
-            "Enable the canonical Gemini dataset mode. Inputs are read from "
+            "Canonical Gemini dataset root. Inputs are read from "
             "<root>/capture_manifest.json, <root>/reference/reference_index.json, "
             "and <root>/rgb/<camera-name>; canonical outputs are written beneath "
-            "the same dataset root. Explicit legacy path arguments are ignored."
+            "the same dataset root."
         ),
     )
     parser.add_argument(
@@ -94,22 +95,6 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
             "Old_name, or Class_name input is normalized to the real pipeline "
             "key (Old_name first, Object_name fallback)."
         ),
-    )
-    parser.add_argument("--image-dir", type=Path, default=Path("assets/images2"))
-    parser.add_argument(
-        "--reference-index",
-        type=Path,
-        default=Path("assets/reference/reference_index.json"),
-    )
-    parser.add_argument(
-        "--scene-meta",
-        type=Path,
-        default=Path("assets/scene_meta2/capture_manifest.json"),
-    )
-    parser.add_argument(
-        "--output-dir",
-        type=Path,
-        default=Path("outputs/cross_image_exemplar_real"),
     )
     parser.add_argument(
         "--input-size",
@@ -486,57 +471,6 @@ def restore_masks(
     return restored
 
 
-def save_results(
-    target: Image.Image,
-    masks: list[np.ndarray],
-    boxes: torch.Tensor,
-    scores: torch.Tensor,
-    output_dir: Path,
-) -> list[dict]:
-    output_dir.mkdir(parents=True, exist_ok=True)
-    overlay_image = target.convert("RGBA")
-    # 실환경 pilot의 주 대상물이 주황/빨강 계열이므로 첫 prediction은 원본 색과
-    # 확실히 대비되는 청록색으로 고정한다. 추가 prediction은 기존 순환 팔레트 사용.
-    colors = [(0, 255, 255), (255, 0, 255), (50, 120, 255), (48, 220, 80)]
-    records: list[dict] = []
-
-    for index, (mask, box, score) in enumerate(zip(masks, boxes, scores)):
-        mask_image = Image.fromarray(mask.astype(np.uint8) * 255, mode="L")
-        mask_image.save(output_dir / f"mask_{index:03d}.png")
-        color = colors[index % len(colors)]
-        color_layer = Image.new("RGBA", target.size, (*color, 0))
-        color_layer.putalpha(mask_image.point(lambda value: 100 if value else 0))
-        overlay_image = Image.alpha_composite(overlay_image, color_layer)
-
-        records.append(
-            {
-                "index": index,
-                "score": float(score.detach().cpu()),
-                "bbox_xyxy": [float(value) for value in box.detach().cpu().tolist()],
-            }
-        )
-
-    draw = ImageDraw.Draw(overlay_image)
-    for record in records:
-        index = record["index"]
-        color = colors[index % len(colors)]
-        box = record["bbox_xyxy"]
-        draw.rectangle(box, outline=(*color, 255), width=4)
-        draw.text(
-            (box[0], max(0, box[1] - 18)),
-            f"(id={index}, prob={record['score']:.2f})",
-            fill=(*color, 255),
-            stroke_width=2,
-            stroke_fill=(255, 255, 255, 255),
-        )
-
-    overlay_image.convert("RGB").save(output_dir / "overlay.jpg", quality=95)
-    (output_dir / "predictions.json").write_text(
-        json.dumps(records, indent=2), encoding="utf-8"
-    )
-    return records
-
-
 def save_dataset_results(
     target: Image.Image,
     masks: list[np.ndarray],
@@ -872,16 +806,6 @@ def _sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
-def clear_previous_results(output_dir: Path) -> None:
-    """재실행 시 해당 target의 과거 생성물만 제거한다."""
-    for mask_path in output_dir.glob("mask_*.png"):
-        mask_path.unlink()
-    for filename in ("overlay.jpg", "predictions.json", "stitched_prompt.jpg"):
-        generated_path = output_dir / filename
-        if generated_path.is_file():
-            generated_path.unlink()
-
-
 def main() -> None:
     args = parse_args()
     if args.input_size % 2:
@@ -895,16 +819,10 @@ def main() -> None:
         else None
     )
     object_name = identity.applied_key if identity is not None else args.object_name
-    dataset_paths = (
-        dataset_mode_paths(args.dataset_root, args.camera_name, object_name)
-        if args.dataset_root is not None
-        else None
-    )
-    image_dir = dataset_paths.image_dir if dataset_paths else args.image_dir
-    reference_index = (
-        dataset_paths.reference_index if dataset_paths else args.reference_index
-    )
-    scene_meta = dataset_paths.capture_manifest if dataset_paths else args.scene_meta
+    dataset_paths = dataset_mode_paths(args.dataset_root, args.camera_name, object_name)
+    image_dir = dataset_paths.image_dir
+    reference_index = dataset_paths.reference_index
+    scene_meta = dataset_paths.capture_manifest
     reference_path, annotation = load_reference_annotation(
         object_name,
         reference_index,
@@ -926,19 +844,13 @@ def main() -> None:
         image_dir,
         scene_meta,
         expected_identity=identity,
-        camera_name=dataset_paths.camera_name if dataset_paths else None,
+        camera_name=dataset_paths.camera_name,
     )
-    manifest_entry = (
-        load_manifest_object_entry(object_name, scene_meta)
-        if dataset_paths is not None
-        else None
-    )
+    manifest_entry = load_manifest_object_entry(object_name, scene_meta)
     object_id = (
-        identity.object_id
-        if identity is not None
-        else manifest_entry.get("object_id") if manifest_entry is not None else None
+        identity.object_id if identity is not None else manifest_entry.get("object_id")
     )
-    if dataset_paths is not None and not isinstance(object_id, str):
+    if not isinstance(object_id, str):
         raise ValueError(
             f"Dataset-mode manifest object {object_name!r} has no object_id."
         )
@@ -969,34 +881,20 @@ def main() -> None:
         .tolist()
     )
 
-    if dataset_paths is not None:
-        summary = build_dataset_summary(
-            paths=dataset_paths,
-            object_name=object_name,
-            object_id=object_id,
-            requested_object_name=args.object_name,
-            identity=identity,
-            manifest_entry=manifest_entry,
-            reference_path=reference_path,
-            reference_box=reference_box,
-            input_size=args.input_size,
-            confidence_threshold=args.confidence_threshold,
-            checkpoint=args.checkpoint,
-            save_diagnostics=args.save_diagnostics,
-        )
-    else:
-        args.output_dir.mkdir(parents=True, exist_ok=True)
-        summary = {
-            "object_name": object_name,
-            "reference_image": str(reference_path),
-            "reference_bbox_xyxy": reference_box,
-            "input_size": args.input_size,
-            "confidence_threshold": args.confidence_threshold,
-            "images": [],
-        }
-        if identity is not None:
-            summary.update(identity.metadata())
-            summary["requested_object_name"] = args.object_name
+    summary = build_dataset_summary(
+        paths=dataset_paths,
+        object_name=object_name,
+        object_id=object_id,
+        requested_object_name=args.object_name,
+        identity=identity,
+        manifest_entry=manifest_entry,
+        reference_path=reference_path,
+        reference_box=reference_box,
+        input_size=args.input_size,
+        confidence_threshold=args.confidence_threshold,
+        checkpoint=args.checkpoint,
+        save_diagnostics=args.save_diagnostics,
+    )
 
     for target_path in image_paths:
         target = load_oriented_rgb(target_path)
@@ -1006,16 +904,7 @@ def main() -> None:
         canvas.paste(target_tile, (0, tile_height))
 
         prompt_preview = None
-        if dataset_paths is None:
-            target_output_dir = args.output_dir / target_path.stem
-            target_output_dir.mkdir(parents=True, exist_ok=True)
-            clear_previous_results(target_output_dir)
-            prompt_preview = canvas.copy()
-            ImageDraw.Draw(prompt_preview).rectangle(
-                prompt_box, outline=(0, 255, 0), width=4
-            )
-            prompt_preview.save(target_output_dir / "stitched_prompt.jpg", quality=92)
-        elif args.save_diagnostics:
+        if args.save_diagnostics:
             prompt_preview = canvas.copy()
             ImageDraw.Draw(prompt_preview).rectangle(
                 prompt_box, outline=(0, 255, 0), width=4
@@ -1046,44 +935,25 @@ def main() -> None:
             args.input_size,
         )
         target_scores = scores[keep_target]
-        if dataset_paths is not None:
-            frame_result = save_dataset_results(
-                target,
-                target_masks,
-                target_boxes,
-                target_scores,
-                paths=dataset_paths,
-                frame_stem=target_path.stem,
-                object_name=object_name,
-                object_id=object_id,
-                source_image=target_path,
-                prompt_preview=prompt_preview,
-                save_diagnostics=args.save_diagnostics,
-            )
-            summary["images"].append(frame_result)
-            prediction_count = frame_result["prediction_count"]
-        else:
-            records = save_results(
-                target, target_masks, target_boxes, target_scores, target_output_dir
-            )
-            summary["images"].append(
-                {
-                    "image": target_path.name,
-                    "prediction_count": len(records),
-                    "predictions": records,
-                }
-            )
-            prediction_count = len(records)
+        frame_result = save_dataset_results(
+            target,
+            target_masks,
+            target_boxes,
+            target_scores,
+            paths=dataset_paths,
+            frame_stem=target_path.stem,
+            object_name=object_name,
+            object_id=object_id,
+            source_image=target_path,
+            prompt_preview=prompt_preview,
+            save_diagnostics=args.save_diagnostics,
+        )
+        summary["images"].append(frame_result)
+        prediction_count = frame_result["prediction_count"]
         print(f"{target_path.name}: {prediction_count} prediction(s)")
 
-    if dataset_paths is not None:
-        finalize_dataset_summary(dataset_paths, summary)
-        print(f"Saved canonical dataset results to {dataset_paths.root}")
-    else:
-        (args.output_dir / "summary.json").write_text(
-            json.dumps(summary, indent=2), encoding="utf-8"
-        )
-        print(f"Saved batch results to {args.output_dir}")
+    finalize_dataset_summary(dataset_paths, summary)
+    print(f"Saved canonical dataset results to {dataset_paths.root}")
 
 
 if __name__ == "__main__":

@@ -119,6 +119,18 @@ Manifest의 `objects.<applied_object>.images_by_camera.top_view_camera`를 먼�
 미구현 경로다.
 
 
+## 테스트
+
+AI가 코드 수정 후 회귀 확인용으로 만든 것. 평소 직접 실행할 필요 없음.
+
+```bash
+conda activate data_gen-inf && cd sam3 && python -m pytest tests/ -q
+```
+
+- `test_cross_image_exemplar_real.py`: 좌표 변환/이미지 목록 선택/결과 저장 로직 (모델 추론 없음, GPU 불필요)
+- `test_real_object_catalog.py`: 객체 이름 해석, reference_index 갱신
+
+
 ## Reference
 
 -
