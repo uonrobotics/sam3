@@ -1,0 +1,55 @@
+{
+    "objects": {
+        "obj_052": {
+            "level_1": "General Goods",
+            "level_2": "Indoor Fragrance",
+            "level_3": "Diffuser Bottle",
+            "object_name": "diffuser_bottle",
+            "color": "pink",
+            "packaging": "",
+            "features": "ceramic material, no lid, vase shape",
+            "description": "A pink ceramic item shaped like a vase, without a lid."
+        },
+        "obj_183": {
+            "level_1": "Office Supplies",
+            "level_2": "Writing Tool",
+            "level_3": "Whiteboard Eraser",
+            "object_name": "whiteboard_eraser",
+            "color": "gray, red, white",
+            "packaging": "",
+            "features": "\"5겹 지우개\" text, rectangular shape",
+            "description": "A gray, red, and white item with “5겹 지우개” text and a rectangular shape."
+        },
+        "obj_028": {
+            "level_1": "General Goods",
+            "level_2": "Smoking Item",
+            "level_3": "Cigarette Pack",
+            "object_name": "parliament_aqua_5_cigarette_pack",
+            "color": "navy, white",
+            "packaging": "paper packaging",
+            "features": "\"parliament\" logo, square shape",
+            "description": "A navy and white paper package with a square shape and \"parliament\" logo."
+        },
+        "obj_118": {
+            "level_1": "Health & Medical",
+            "level_2": "Oral Medicine",
+            "level_3": "Pain Reliever",
+            "object_name": "tylenol_bottle",
+            "color": "white, red",
+            "packaging": "plastic bottle",
+            "features": "cylindrical shape, \"타이레놀\" text",
+            "description": "A white and red plastic bottle with a cylindrical shape and “타이레놀” text."
+        },
+        "obj_016": {
+            "level_1": "Electronics",
+            "level_2": "Power Supply",
+            "level_3": "Charger",
+            "object_name": "wired_fast_charger",
+            "color": "white",
+            "packaging": "",
+            "features": "plug type, square shape",
+            "description": "A white plug-type item with a square shape."
+        }
+    },
+    "Description": " A pink ceramic item shaped like a vase, without a lid. A gray, red, and white item with “5겹 지우개” text and a rectangular shape. A navy and white paper package with a square shape and \"parliament\" logo. A white and red plastic bottle with a cylindrical shape and “타이레놀” text. A white plug-type item with a square shape."
+}
