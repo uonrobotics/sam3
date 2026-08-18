@@ -129,6 +129,21 @@ def resolve_real_object(query: str, objects_metadata: str | Path) -> RealObjectI
     )
 
 
+def resolve_optional_identity(
+    query: str, objects_metadata: str | Path | None
+) -> RealObjectIdentity | None:
+    """Resolve ``query`` against the catalog only when a catalog path is given.
+
+    Both real-pipeline CLIs accept an optional ``--objects-metadata``; this is
+    the shared "no catalog means no identity" policy they were each
+    reimplementing as an inline ternary.
+    """
+
+    if objects_metadata is None:
+        return None
+    return resolve_real_object(query, objects_metadata)
+
+
 def _load_rows(text: str, source_path: Path) -> list[_CatalogRow]:
     try:
         reader = csv.DictReader(io.StringIO(text, newline=""), strict=True)

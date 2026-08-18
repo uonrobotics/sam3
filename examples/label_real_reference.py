@@ -16,9 +16,9 @@ import numpy as np
 from PIL import Image, ImageDraw, ImageOps
 
 if __package__:
-    from .real_object_catalog import resolve_real_object
+    from .real_object_catalog import resolve_optional_identity
 else:  # pragma: no cover - exercised by direct CLI execution
-    from real_object_catalog import resolve_real_object
+    from real_object_catalog import resolve_optional_identity
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,11 +110,7 @@ def update_reference_index(
 
 def main() -> None:
     args = parse_args()
-    identity = (
-        resolve_real_object(args.object_name, args.objects_metadata)
-        if args.objects_metadata is not None
-        else None
-    )
+    identity = resolve_optional_identity(args.object_name, args.objects_metadata)
     object_name = identity.applied_key if identity is not None else args.object_name
     identity_metadata = identity.metadata() if identity is not None else None
     image_path = args.image.resolve()

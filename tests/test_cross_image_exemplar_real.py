@@ -357,7 +357,7 @@ def test_target_image_cannot_escape_image_directory(tmp_path):
         encoding="utf-8",
     )
 
-    with pytest.raises(ValueError, match="relative to --image-dir"):
+    with pytest.raises(ValueError, match="relative to the dataset image directory"):
         load_target_image_paths("paper_cup", image_dir, manifest_path)
 
 

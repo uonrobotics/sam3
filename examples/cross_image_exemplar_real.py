@@ -31,9 +31,9 @@ from sam3.model_builder import build_sam3_image_model
 from sam3.visualization_utils import normalize_bbox
 
 if __package__:
-    from .real_object_catalog import RealObjectIdentity, resolve_real_object
+    from .real_object_catalog import RealObjectIdentity, resolve_optional_identity
 else:  # pragma: no cover - exercised by direct CLI execution
-    from real_object_catalog import RealObjectIdentity, resolve_real_object
+    from real_object_catalog import RealObjectIdentity, resolve_optional_identity
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
@@ -313,7 +313,7 @@ def load_target_image_paths(
             relative_path = Path(image_name)
             if relative_path.is_absolute() or ".." in relative_path.parts:
                 raise ValueError(
-                    f"Target image must be relative to --image-dir: {image_name!r}"
+                    f"Target image must be relative to the dataset image directory: {image_name!r}"
                 )
             if len(relative_path.parts) == 1:
                 camera_relative_names.append(image_name)
@@ -336,14 +336,14 @@ def load_target_image_paths(
         relative_path = Path(image_name)
         if relative_path.is_absolute() or ".." in relative_path.parts:
             raise ValueError(
-                f"Target image must be relative to --image-dir: {image_name!r}"
+                f"Target image must be relative to the dataset image directory: {image_name!r}"
             )
         image_path = (image_root / relative_path).resolve()
         try:
             image_path.relative_to(image_root)
         except ValueError as exc:
             raise ValueError(
-                f"Target image escapes --image-dir: {image_name!r}"
+                f"Target image escapes the dataset image directory: {image_name!r}"
             ) from exc
         if not image_path.is_file():
             raise FileNotFoundError(f"Target image not found: {image_path}")
@@ -813,11 +813,7 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("SAM 3 real batch inference requires a CUDA GPU.")
 
-    identity = (
-        resolve_real_object(args.object_name, args.objects_metadata)
-        if args.objects_metadata is not None
-        else None
-    )
+    identity = resolve_optional_identity(args.object_name, args.objects_metadata)
     object_name = identity.applied_key if identity is not None else args.object_name
     dataset_paths = dataset_mode_paths(args.dataset_root, args.camera_name, object_name)
     image_dir = dataset_paths.image_dir
