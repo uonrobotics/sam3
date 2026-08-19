@@ -1,3 +1,10 @@
+# SAM3 Custom (uonrobotics fork)
+
+이 fork는 upstream [SAM 3](https://github.com/facebookresearch/sam3)에 예제 3개를
+추가합니다: 가상환경 단일 이미지 추론, 실환경 reference BBox 라벨링 툴, 실환경 scene
+전체 batch 추론. 기본 설치는 upstream [`README.md`](README.md)를 따르고, 이 문서는
+추가된 기능만 다룹니다.
+
 ## Installation
 
 -
