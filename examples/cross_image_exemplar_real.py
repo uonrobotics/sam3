@@ -75,8 +75,9 @@ class DatasetModePaths:
     capture_manifest: Path
     bbox_dir: Path
     inst_seg_dir: Path
-    diagnostics_object_dir: Path
-    summary_path: Path
+    diagnostics_overlay_dir: Path
+    diagnostics_stitched_dir: Path
+    inference_meta_dir: Path
 
 
 @dataclass(frozen=True)
@@ -155,13 +156,11 @@ def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
 def dataset_mode_paths(
     dataset_root: Path,
     camera_name: str,
-    object_name: str,
 ) -> DatasetModePaths:
     """Resolve the fixed Gemini dataset-mode input and output contract."""
 
     root = dataset_root.expanduser().resolve()
     camera_component = _safe_path_component(camera_name, "camera name")
-    object_component = _safe_path_component(object_name, "object name")
     return DatasetModePaths(
         root=root,
         camera_name=camera_component,
@@ -170,17 +169,11 @@ def dataset_mode_paths(
         capture_manifest=root / "capture_manifest.json",
         bbox_dir=root / "bbox" / camera_component,
         inst_seg_dir=root / "inst_seg" / camera_component,
-        diagnostics_object_dir=(
-            root / "diagnostics" / "sam3" / camera_component / object_component
+        diagnostics_overlay_dir=root / "diagnostics" / camera_component / "overlay",
+        diagnostics_stitched_dir=(
+            root / "diagnostics" / camera_component / "stitched_prompt"
         ),
-        summary_path=(
-            root
-            / "inference_meta"
-            / "sam3"
-            / camera_component
-            / object_component
-            / "summary.json"
-        ),
+        inference_meta_dir=root / "inference_meta" / camera_component,
     )
 
 
@@ -545,7 +538,6 @@ def save_dataset_results(
     """Publish one frame in the canonical Gemini dataset output layout."""
 
     frame_component = _safe_path_component(frame_stem, "frame stem")
-    _safe_path_component(object_name, "object name")
     if re.fullmatch(r"obj_\d{3}", object_id) is None:
         raise ValueError(
             f"Dataset-mode object_id must match 'obj_NNN', got {object_id!r}."
@@ -603,9 +595,8 @@ def save_dataset_results(
     if save_diagnostics:
         assert prompt_preview is not None  # validated before publishing artifacts
         assert overlay is not None
-        diagnostic_dir = paths.diagnostics_object_dir / frame_component
-        overlay_path = diagnostic_dir / "overlay.jpg"
-        stitched_path = diagnostic_dir / "stitched_prompt.jpg"
+        overlay_path = paths.diagnostics_overlay_dir / f"{frame_component}.jpg"
+        stitched_path = paths.diagnostics_stitched_dir / f"{frame_component}.jpg"
         _atomic_save_image(overlay, overlay_path, "JPEG", quality=95)
         _atomic_save_image(
             prompt_preview.convert("RGB"), stitched_path, "JPEG", quality=92
@@ -615,8 +606,10 @@ def save_dataset_results(
             "stitched_prompt": _dataset_relative_path(stitched_path, paths.root),
         }
 
-    return {
+    result = {
         "frame_id": frame_component,
+        "object_name": object_name,
+        "object_id": object_id,
         "image": _dataset_relative_path(source_image, paths.root),
         "image_sha256": _sha256_file(source_image),
         "image_width": width,
@@ -632,6 +625,9 @@ def save_dataset_results(
             **diagnostic_paths,
         },
     }
+    inference_meta_path = paths.inference_meta_dir / f"{frame_component}.json"
+    _atomic_write_json(inference_meta_path, result)
+    return result
 
 
 def _dataset_prediction_records(
@@ -771,90 +767,6 @@ def _dataset_relative_path(path: Path, dataset_root: Path) -> str:
         raise ValueError(f"Dataset artifact path escapes dataset root: {path}") from exc
 
 
-def build_dataset_summary(
-    *,
-    paths: DatasetModePaths,
-    object_name: str,
-    object_id: str,
-    requested_object_name: str,
-    identity: RealObjectIdentity | None,
-    manifest_entry: dict,
-    reference_path: Path,
-    reference_box: list[float],
-    input_size: int,
-    confidence_threshold: float,
-    checkpoint: Path | None,
-    save_diagnostics: bool,
-) -> dict:
-    """Create run-level provenance; frame results are appended by the caller."""
-
-    summary: dict = {
-        "schema_version": "1.0",
-        "artifact_type": "sam3_real_pcs_summary",
-        "status": "running",
-        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
-        "mode": "dataset",
-        "camera_name": paths.camera_name,
-        "object_name": object_name,
-        "object_id": object_id,
-        "requested_object_name": requested_object_name,
-        "reference_image": _dataset_relative_path(reference_path, paths.root),
-        "reference_bbox_xyxy": reference_box,
-        "input_size": input_size,
-        "confidence_threshold": confidence_threshold,
-        "checkpoint": str(checkpoint.expanduser().resolve()) if checkpoint else None,
-        "save_diagnostics": save_diagnostics,
-        "output_contract": {
-            "selection_policy": "highest_score_single_manipulation_target",
-            "bbox_format": "xyxy_integer_half_open_covering_box",
-            "inst_seg_mode": "rgba_uint8",
-            "target_rgba": list(TARGET_RGBA),
-            "unlabelled_rgba": list(UNLABELLED_RGBA),
-        },
-        "provenance": {
-            "capture_manifest": _dataset_relative_path(
-                paths.capture_manifest, paths.root
-            ),
-            "capture_manifest_sha256": _sha256_file(paths.capture_manifest),
-            "reference_index": _dataset_relative_path(
-                paths.reference_index, paths.root
-            ),
-            "reference_index_sha256": _sha256_file(paths.reference_index),
-            "image_directory": _dataset_relative_path(paths.image_dir, paths.root),
-        },
-        "images": [],
-    }
-    if identity is not None:
-        summary.update(identity.metadata())
-    else:
-        for field in (
-            "old_name",
-            "catalog_object_name",
-            "key_namespace",
-            "catalog_year",
-            "object_catalog_sha256",
-        ):
-            if field in manifest_entry:
-                summary[field] = manifest_entry[field]
-    return summary
-
-
-def finalize_dataset_summary(paths: DatasetModePaths, summary: dict) -> None:
-    """Write the run summary last so it acts as the completed-run marker."""
-
-    images = summary.get("images", [])
-    summary["status"] = "complete"
-    summary["completed_at_utc"] = datetime.now(timezone.utc).isoformat()
-    summary["frame_count"] = len(images)
-    summary["frames_with_predictions"] = sum(
-        item.get("status") == "ok" for item in images
-    )
-    summary["frames_without_predictions"] = sum(
-        item.get("status") == "no_predictions" for item in images
-    )
-    _atomic_write_json(paths.summary_path, summary)
-
-
 def _highlight(text: str, ansi_code: str) -> str:
     """TTY에 출력될 때만 색을 입힌다 (파일로 리다이렉트되면 평문 그대로)."""
     if not sys.stdout.isatty():
@@ -917,11 +829,10 @@ def main() -> None:
     tile_width = args.input_size
     tile_height = args.input_size // 2
     reference_index_path = scene_root / "reference" / "reference_index.json"
-    errors_path = scene_root / "inference_meta" / "sam3" / "errors.jsonl"
+    errors_path = scene_root / "inference_meta" / "errors.jsonl"
 
     reference_cache: dict[str, ReferenceBundle] = {}
     identity_failures: dict[str, Exception] = {}
-    summaries: dict[tuple[str, str], dict] = {}
 
     processed = skipped = failed = 0
 
@@ -948,7 +859,7 @@ def main() -> None:
                     raise
                 reference_cache[item.object_name] = bundle
 
-            paths = dataset_mode_paths(scene_root, item.camera_name, item.object_name)
+            paths = dataset_mode_paths(scene_root, item.camera_name)
             target_path = resolve_scene_relative_image(
                 scene_root, item.rgb_relative_path
             )
@@ -1004,24 +915,6 @@ def main() -> None:
                 save_diagnostics=args.save_diagnostics,
             )
 
-            summary_key = (item.camera_name, item.object_name)
-            if summary_key not in summaries:
-                summaries[summary_key] = build_dataset_summary(
-                    paths=paths,
-                    object_name=item.object_name,
-                    object_id=bundle.object_id,
-                    requested_object_name=item.object_name,
-                    identity=bundle.identity,
-                    manifest_entry={},
-                    reference_path=bundle.reference_path,
-                    reference_box=bundle.reference_box,
-                    input_size=args.input_size,
-                    confidence_threshold=args.confidence_threshold,
-                    checkpoint=args.checkpoint,
-                    save_diagnostics=args.save_diagnostics,
-                )
-            summaries[summary_key]["images"].append(frame_result)
-
             processed += 1
             print(
                 f"{item.capture_id} [{item.camera_name}] {item.object_name}: "
@@ -1042,11 +935,6 @@ def main() -> None:
                 file=sys.stderr,
             )
             continue
-
-    for (camera_name, object_name), summary in summaries.items():
-        finalize_dataset_summary(
-            dataset_mode_paths(scene_root, camera_name, object_name), summary
-        )
 
     summary_line = (
         f"Processed {processed}, skipped {skipped} already-done, {failed} failed "

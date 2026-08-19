@@ -69,7 +69,7 @@ frame마다 `bbox/<camera>/<id>.json` + `inst_seg/<camera>/<id>.png` +
 `inst_seg/<camera>/semantics_mapping_<id>.json` 세 파일이 모두 있으면 완료로 보고
 건너뛴다. 그래서 같은 명령을 재실행하면 중단된 지점부터 자동으로 이어서 처리되고,
 크래시나 Ctrl+C로 중단돼도 안전하다. object_name이 없는(unassigned) frame은 건너뛰고,
-frame 하나가 실패해도 전체 batch는 멈추지 않고 `inference_meta/sam3/errors.jsonl`에
+frame 하나가 실패해도 전체 batch는 멈추지 않고 `inference_meta/errors.jsonl`에
 기록한 뒤 다음 frame으로 넘어간다. 특정 object만 처리하려면 `--object-name`으로
 필터링할 수 있다(완료 판정은 그대로 적용된다).
 
@@ -93,10 +93,11 @@ Manifest의 `frames.<capture_id>.views.<camera>.files.rgb`를 읽어 대상 이�
 ├── bbox/top_view_camera/0000.json
 ├── inst_seg/top_view_camera/0000.png
 ├── inst_seg/top_view_camera/semantics_mapping_0000.json
-├── inference_meta/sam3/top_view_camera/paper_cup/summary.json
-└── diagnostics/sam3/top_view_camera/paper_cup/0000/
-    ├── overlay.jpg
-    └── stitched_prompt.jpg
+├── inference_meta/top_view_camera/0000.json
+├── inference_meta/errors.jsonl
+└── diagnostics/top_view_camera/
+    ├── overlay/0000.jpg
+    └── stitched_prompt/0000.jpg
 ```
 
 - `bbox`는 confidence가 가장 높은 prediction 하나만
@@ -104,9 +105,13 @@ Manifest의 `frames.<capture_id>.views.<camera>.files.rgb`를 읽어 대상 이�
 - `inst_seg`는 입력 RGB와 같은 크기의 RGBA PNG다. 선택 mask는
   `(255, 25, 25, 255)`, 나머지는 opaque black `UNLABELLED`이다. 색과
   `Class_name`의 관계는 같은 stem의 `semantics_mapping_*.json`이 정의한다.
-- summary에는 선택 여부를 포함한 모든 candidate, score, 입력 provenance와 frame
-  status를 항상 기록한다.
-- overlay와 stitched prompt만 선택적 diagnostic이다. 저장하지 않으려면
+- `inference_meta/<camera>/NNNN.json`에는 선택 여부를 포함한 모든 candidate와
+  score를 frame 단위로 기록한다(`bbox`/`inst_seg`엔 선택된 결과만 남으므로, 왜 이
+  결과가 나왔는지 볼 때 참고). `inference_meta/errors.jsonl`은 처리 실패한
+  frame을 append 방식으로 기록한다.
+- overlay와 stitched prompt는 `bbox`/`inst_seg`처럼 capture ID 순서대로 저장되므로
+  이미지 뷰어로 순서대로 넘겨보며 라벨링 결과를 검수할 수 있다. 선택적 diagnostic이라
+  저장하지 않으려면
   `--no-save-diagnostics`를 추가한다.
 - Dataset mode는 `mask_000.png` 같은 개별 binary mask를 생성하지 않는다.
 

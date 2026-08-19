@@ -9,10 +9,8 @@ from examples.cross_image_exemplar_real import (
     BACKGROUND_RGBA,
     TARGET_RGBA,
     UNLABELLED_RGBA,
-    build_dataset_summary,
     dataset_mode_paths,
     discover_frame_work_items,
-    finalize_dataset_summary,
     frame_is_done,
     letterbox,
     load_oriented_rgb,
@@ -197,7 +195,7 @@ def test_frame_is_done_requires_all_three_output_files(tmp_path):
 
 
 def test_log_frame_error_appends_jsonl_records(tmp_path):
-    errors_path = tmp_path / "inference_meta" / "sam3" / "errors.jsonl"
+    errors_path = tmp_path / "inference_meta" / "errors.jsonl"
     log_frame_error(
         errors_path,
         capture_id="0000",
@@ -361,8 +359,10 @@ def test_reference_loader_rejects_identity_drift(tmp_path):
         load_reference_annotation("paper_cup", index_path, expected_identity=identity)
 
 
-def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_path):
-    paths = dataset_mode_paths(tmp_path, "top_view_camera", "paper_cup")
+def test_dataset_mode_writes_canonical_highest_score_outputs_and_inference_meta(
+    tmp_path,
+):
+    paths = dataset_mode_paths(tmp_path, "top_view_camera")
     assert paths.capture_manifest == tmp_path / "capture_manifest.json"
     assert paths.reference_index == tmp_path / "reference" / "reference_index.json"
     assert paths.image_dir == tmp_path / "rgb" / "top_view_camera"
@@ -398,8 +398,9 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_pat
     mapping_path = (
         tmp_path / "inst_seg" / "top_view_camera" / "semantics_mapping_0007.json"
     )
-    diagnostic_dir = (
-        tmp_path / "diagnostics" / "sam3" / "top_view_camera" / "paper_cup" / "0007"
+    overlay_dir = tmp_path / "diagnostics" / "top_view_camera" / "overlay"
+    stitched_dir = (
+        tmp_path / "diagnostics" / "top_view_camera" / "stitched_prompt"
     )
     assert json.loads(bbox_path.read_text(encoding="utf-8")) == {
         "obj_120": [2, 0, 6, 4]
@@ -416,8 +417,8 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_pat
         str(UNLABELLED_RGBA): {"class": "UNLABELLED"},
         str(TARGET_RGBA): {"class": "obj_120"},
     }
-    assert (diagnostic_dir / "overlay.jpg").is_file()
-    assert (diagnostic_dir / "stitched_prompt.jpg").is_file()
+    assert (overlay_dir / "0007.jpg").is_file()
+    assert (stitched_dir / "0007.jpg").is_file()
     assert not list(tmp_path.rglob("mask_*.png"))
     assert frame_result["selected_prediction_index"] == 1
     assert [item["selected"] for item in frame_result["predictions"]] == [
@@ -428,55 +429,25 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_pat
         "bbox": "bbox/top_view_camera/0007.json",
         "inst_seg": "inst_seg/top_view_camera/0007.png",
         "semantics_mapping": ("inst_seg/top_view_camera/semantics_mapping_0007.json"),
-        "overlay": ("diagnostics/sam3/top_view_camera/paper_cup/0007/overlay.jpg"),
-        "stitched_prompt": (
-            "diagnostics/sam3/top_view_camera/paper_cup/0007/" "stitched_prompt.jpg"
-        ),
+        "overlay": "diagnostics/top_view_camera/overlay/0007.jpg",
+        "stitched_prompt": "diagnostics/top_view_camera/stitched_prompt/0007.jpg",
     }
 
-    paths.capture_manifest.write_text('{"objects": {}}', encoding="utf-8")
-    paths.reference_index.parent.mkdir(parents=True)
-    paths.reference_index.write_text('{"objects": {}}', encoding="utf-8")
-    reference_path = tmp_path / "reference" / "paper_cup" / "0000.png"
-    reference_path.parent.mkdir(parents=True)
-    Image.new("RGB", (4, 4)).save(reference_path)
-    summary = build_dataset_summary(
-        paths=paths,
-        object_name="paper_cup",
-        object_id="obj_120",
-        requested_object_name="paper_cup",
-        identity=_paper_cup_identity(),
-        manifest_entry={"object_id": "obj_120"},
-        reference_path=reference_path,
-        reference_box=[0.0, 0.0, 4.0, 4.0],
-        input_size=1008,
-        confidence_threshold=0.5,
-        checkpoint=None,
-        save_diagnostics=True,
+    inference_meta_path = (
+        tmp_path / "inference_meta" / "top_view_camera" / "0007.json"
     )
-    summary["images"].append(frame_result)
-    finalize_dataset_summary(paths, summary)
-    summary_path = (
-        tmp_path
-        / "inference_meta"
-        / "sam3"
-        / "top_view_camera"
-        / "paper_cup"
-        / "summary.json"
-    )
-    written_summary = json.loads(summary_path.read_text(encoding="utf-8"))
-    assert written_summary["status"] == "complete"
-    assert written_summary["object_id"] == "obj_120"
-    assert written_summary["frame_count"] == 1
-    assert written_summary["frames_with_predictions"] == 1
-    assert written_summary["images"][0]["predictions"][0]["score"] == pytest.approx(0.6)
+    written_meta = json.loads(inference_meta_path.read_text(encoding="utf-8"))
+    assert written_meta == frame_result
+    assert written_meta["object_name"] == "paper_cup"
+    assert written_meta["object_id"] == "obj_120"
+    assert written_meta["predictions"][0]["score"] == pytest.approx(0.6)
 
 
 def test_dataset_mode_overlay_draws_only_the_selected_prediction(tmp_path):
     """diagnostics/overlay must match inst_seg: only the highest-score
     candidate is drawn, not every raw detection in the target region."""
 
-    paths = dataset_mode_paths(tmp_path, "top_view_camera", "paper_cup")
+    paths = dataset_mode_paths(tmp_path, "top_view_camera")
     paths.image_dir.mkdir(parents=True)
     source_image = paths.image_dir / "0007.png"
     background = (20, 30, 40)
@@ -507,13 +478,7 @@ def test_dataset_mode_overlay_draws_only_the_selected_prediction(tmp_path):
 
     assert frame_result["selected_prediction_index"] == 1
     overlay_path = (
-        tmp_path
-        / "diagnostics"
-        / "sam3"
-        / "top_view_camera"
-        / "paper_cup"
-        / "0007"
-        / "overlay.jpg"
+        tmp_path / "diagnostics" / "top_view_camera" / "overlay" / "0007.jpg"
     )
     with Image.open(overlay_path) as opened:
         overlay = np.asarray(opened.convert("RGB")).astype(int)
@@ -528,7 +493,7 @@ def test_dataset_mode_overlay_draws_only_the_selected_prediction(tmp_path):
 def test_dataset_mode_no_predictions_writes_unlabelled_mask_without_diagnostics(
     tmp_path,
 ):
-    paths = dataset_mode_paths(tmp_path, "top_view_camera", "paper_cup")
+    paths = dataset_mode_paths(tmp_path, "top_view_camera")
     source_image = tmp_path / "rgb" / "top_view_camera" / "0008.png"
     source_image.parent.mkdir(parents=True)
     target = Image.new("RGB", (5, 3), (255, 255, 255))
