@@ -7,7 +7,9 @@
 
 1. 가상환경 PCS 객체 분할 : 가상환경 기반 reference (image exemplar)로 단일 입력 이미지 객체 분할 (가능성 검증)
 2. Image Exemplar 라벨링 툴 :  실환경 reference BBox 생성 도구 (label_real_reference.py)
--> 사용 방법 : 마우스로 BBox 생성, 엔터로 등록, C로 취소
+-> 사용 방법 : dataset-root/scene 지정 후 실행하면 Tkinter GUI가 열림. 마우스
+   드래그로 BBox를 그리면 즉시 저장되고 다음 미라벨링 object로 자동 이동. 이미
+   라벨링된 object를 다시 드래그하면 덮어쓰기 확인 팝업이 뜸.
 3. 실환경 PCS 객체 분할 : 실환경 기반 reference (image exemplar)로 다중 입력 이미지 객체 분할
 
 
@@ -54,15 +56,16 @@ python examples/cross_image_exemplar.py \
 - `--objects-metadata`를 지정한 추론은 위 identity field와 catalog SHA-256을
   reference index, BBox, capture manifest 사이에서 strict 검증한 뒤 시작한다.
 
-실환경 reference BBox 라벨링 (`reference-gen`의 객체별 고정 slot은 `0000.png`)
+실환경 reference BBox 라벨링 (`reference-gen`의 객체별 고정 slot은 `0000.png`).
+`--dataset-root`/`--scene` 두 인자만 받는 Tkinter 대화형 GUI로,
+`reference/` 아래 모든 object 폴더를 알파벳순으로 순회한다. 라벨링 안 된 object부터
+자동으로 보여주고, 드래그로 BBox를 그리면 즉시 저장 후 다음 미라벨링 object로
+넘어가며, 이미 라벨링된 object는 덮어쓰기 전에 확인 팝업을 띄운다.
 
 ```bash
 python examples/label_real_reference.py \
-  --image /media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table/reference/paper_cup/0000.png \
-  --object-name paper_cup \
-  --objects-metadata /media/uon/data1/gemini/objects_metadata.csv \
-  --bbox-dir /media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table/reference/paper_cup \
-  --reference-index /media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table/reference/reference_index.json
+  --dataset-root /media/uon/data1/gemini \
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table
 ```
 
 실환경 이미지 전체 추론
