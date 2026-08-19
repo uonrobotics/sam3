@@ -11,14 +11,17 @@ from examples.cross_image_exemplar_real import (
     UNLABELLED_RGBA,
     build_dataset_summary,
     dataset_mode_paths,
+    discover_frame_work_items,
     finalize_dataset_summary,
+    frame_is_done,
     letterbox,
     load_oriented_rgb,
     load_reference_annotation,
-    load_target_image_paths,
+    log_frame_error,
     map_box_to_canvas,
     map_boxes_to_original,
     parse_args,
+    resolve_scene_relative_image,
     restore_masks,
     save_dataset_results,
 )
@@ -83,85 +86,154 @@ def test_load_oriented_rgb_applies_exif_orientation(tmp_path, orientation):
     assert oriented.mode == "RGB"
 
 
-def test_target_images_are_selected_from_manifest(tmp_path):
-    image_dir = tmp_path / "images"
-    image_dir.mkdir()
-    for filename in ("selected_b.jpg", "ignored.jpg", "selected_a.png"):
-        Image.new("RGB", (10, 10)).save(image_dir / filename)
-    manifest_path = tmp_path / "capture_manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "objects": {
-                    "wire_tracker": {"images": ["selected_b.jpg", "selected_a.png"]}
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    selected = load_target_image_paths(
-        "wire_tracker", image_dir=image_dir, scene_meta_path=manifest_path
-    )
-    assert [path.name for path in selected] == ["selected_b.jpg", "selected_a.png"]
-
-
 def test_dataset_diagnostics_boolean_option_defaults_on_and_can_be_disabled():
-    enabled = parse_args(["--object-name", "paper_cup", "--dataset-root", "/tmp/scene"])
+    enabled = parse_args(["--dataset-root", "/tmp/gemini", "--scene", "scene"])
     disabled = parse_args(
         [
-            "--object-name",
-            "paper_cup",
             "--dataset-root",
-            "/tmp/scene",
+            "/tmp/gemini",
+            "--scene",
+            "scene",
             "--no-save-diagnostics",
         ]
     )
 
-    assert enabled.camera_name == "top_view_camera"
+    assert enabled.object_name is None
     assert enabled.save_diagnostics is True
     assert disabled.save_diagnostics is False
 
 
-def test_target_images_prefer_requested_camera_then_fall_back_to_legacy(tmp_path):
-    image_dir = tmp_path / "rgb" / "top_view_camera"
-    image_dir.mkdir(parents=True)
-    for filename in ("top.png", "legacy.png"):
-        Image.new("RGB", (10, 10)).save(image_dir / filename)
-    manifest_path = tmp_path / "capture_manifest.json"
+def test_parse_args_accepts_optional_object_name_filter():
+    args = parse_args(
+        [
+            "--dataset-root",
+            "/tmp/gemini",
+            "--scene",
+            "scene",
+            "--object-name",
+            "mouse",
+        ]
+    )
+    assert args.object_name == "mouse"
+
+
+def _frame(object_name, views):
+    return {"object_name": object_name, "views": views}
+
+
+def _view(rgb_path):
+    return {"files": {"rgb": rgb_path}}
+
+
+def test_discover_frame_work_items_orders_by_capture_id_as_integer():
+    # "10000" sorts before "9999" lexicographically but must come after it
+    # numerically once a scene passes 9999 frames.
     manifest = {
-        "objects": {
-            "paper_cup": {
-                "images_by_camera": {
-                    "top_view_camera": ["top.png"],
-                    "side_view_camera": ["side.png"],
-                },
-                "images": [
-                    "top_view_camera/legacy.png",
-                    "side_view_camera/side.png",
-                ],
-            }
+        "frames": {
+            "10000": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/10000.png")}),
+            "9999": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/9999.png")}),
+            "0001": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
         }
     }
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
+    items = discover_frame_work_items(manifest, object_name_filter=None)
+    assert [item.capture_id for item in items] == ["0001", "9999", "10000"]
 
-    selected = load_target_image_paths(
-        "paper_cup",
-        image_dir,
-        manifest_path,
-        camera_name="top_view_camera",
-    )
-    assert [path.name for path in selected] == ["top.png"]
 
-    manifest["objects"]["paper_cup"]["images_by_camera"].pop("top_view_camera")
-    manifest_path.write_text(json.dumps(manifest), encoding="utf-8")
-    selected = load_target_image_paths(
-        "paper_cup",
-        image_dir,
-        manifest_path,
+def test_discover_frame_work_items_skips_unassigned_frames():
+    manifest = {
+        "frames": {
+            "0000": _frame(None, {"top_view_camera": _view("rgb/top_view_camera/0000.png")}),
+            "0001": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
+        }
+    }
+    items = discover_frame_work_items(manifest, object_name_filter=None)
+    assert [item.capture_id for item in items] == ["0001"]
+
+
+def test_discover_frame_work_items_filters_by_object_name():
+    manifest = {
+        "frames": {
+            "0000": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0000.png")}),
+            "0001": _frame("cereal_snack", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
+        }
+    }
+    items = discover_frame_work_items(manifest, object_name_filter="cereal_snack")
+    assert [item.capture_id for item in items] == ["0001"]
+    assert items[0].object_name == "cereal_snack"
+
+
+def test_discover_frame_work_items_visits_every_camera_in_a_frame():
+    manifest = {
+        "frames": {
+            "0000": _frame(
+                "mouse",
+                {
+                    "top_view_camera": _view("rgb/top_view_camera/0000.png"),
+                    "side_view_camera": _view("rgb/side_view_camera/0000.png"),
+                },
+            ),
+        }
+    }
+    items = discover_frame_work_items(manifest, object_name_filter=None)
+    assert [item.camera_name for item in items] == ["side_view_camera", "top_view_camera"]
+    assert all(item.capture_id == "0000" and item.object_name == "mouse" for item in items)
+
+
+def test_frame_is_done_requires_all_three_output_files(tmp_path):
+    assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
+
+    bbox_dir = tmp_path / "bbox" / "top_view_camera"
+    bbox_dir.mkdir(parents=True)
+    (bbox_dir / "0000.json").write_text("{}")
+    assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
+
+    inst_seg_dir = tmp_path / "inst_seg" / "top_view_camera"
+    inst_seg_dir.mkdir(parents=True)
+    (inst_seg_dir / "0000.png").write_bytes(b"")
+    assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
+
+    (inst_seg_dir / "semantics_mapping_0000.json").write_text("{}")
+    assert frame_is_done(tmp_path, "top_view_camera", "0000") is True
+
+
+def test_log_frame_error_appends_jsonl_records(tmp_path):
+    errors_path = tmp_path / "inference_meta" / "sam3" / "errors.jsonl"
+    log_frame_error(
+        errors_path,
+        capture_id="0000",
         camera_name="top_view_camera",
+        object_name="mouse",
+        error=ValueError("boom"),
     )
-    assert [path.name for path in selected] == ["legacy.png"]
+    log_frame_error(
+        errors_path,
+        capture_id="0001",
+        camera_name="top_view_camera",
+        object_name="mouse",
+        error=RuntimeError("boom again"),
+    )
+    lines = errors_path.read_text(encoding="utf-8").splitlines()
+    assert len(lines) == 2
+    first = json.loads(lines[0])
+    assert first["capture_id"] == "0000"
+    assert first["error_type"] == "ValueError"
+    second = json.loads(lines[1])
+    assert second["capture_id"] == "0001"
+    assert second["error_type"] == "RuntimeError"
+
+
+def test_resolve_scene_relative_image_accepts_files_under_scene_root(tmp_path):
+    image_dir = tmp_path / "rgb" / "top_view_camera"
+    image_dir.mkdir(parents=True)
+    (image_dir / "0000.png").write_bytes(b"fake")
+    resolved = resolve_scene_relative_image(tmp_path, "rgb/top_view_camera/0000.png")
+    assert resolved == (image_dir / "0000.png").resolve()
+
+
+def test_resolve_scene_relative_image_rejects_escaping_paths(tmp_path):
+    (tmp_path / "outside.png").write_bytes(b"fake")
+    with pytest.raises(ValueError, match="relative to the scene root"):
+        resolve_scene_relative_image(tmp_path, "../outside.png")
 
 
 def test_reference_loader_resolves_reference_gen_object_directory(tmp_path):
@@ -217,7 +289,7 @@ def _paper_cup_identity() -> RealObjectIdentity:
     )
 
 
-def test_catalog_identity_joins_reference_bbox_and_capture_manifest(tmp_path):
+def test_reference_loader_validates_catalog_identity(tmp_path):
     identity = _paper_cup_identity()
     identity_metadata = identity.metadata()
     reference_dir = tmp_path / "reference"
@@ -229,6 +301,7 @@ def test_catalog_identity_joins_reference_bbox_and_capture_manifest(tmp_path):
         json.dumps(
             {
                 **identity_metadata,
+                "object_name": "paper_cup",
                 "bbox_format": "xyxy",
                 "bbox": [1, 1, 9, 9],
             }
@@ -251,41 +324,15 @@ def test_catalog_identity_joins_reference_bbox_and_capture_manifest(tmp_path):
         encoding="utf-8",
     )
 
-    image_dir = tmp_path / "rgb"
-    image_dir.mkdir()
-    Image.new("RGB", (10, 10)).save(image_dir / "0000.png")
-    manifest_path = tmp_path / "capture_manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "object_catalog": {"sha256": identity.object_catalog_sha256},
-                "objects": {
-                    "paper_cup": {
-                        **identity_metadata,
-                        "images": ["0000.png"],
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
     loaded_reference, annotation = load_reference_annotation(
         "paper_cup", index_path, expected_identity=identity
-    )
-    targets = load_target_image_paths(
-        "paper_cup",
-        image_dir,
-        manifest_path,
-        expected_identity=identity,
     )
 
     assert loaded_reference == reference_image.resolve()
     assert annotation["object_id"] == "obj_120"
-    assert targets == [(image_dir / "0000.png").resolve()]
 
 
-def test_catalog_mode_rejects_reference_or_manifest_identity_drift(tmp_path):
+def test_reference_loader_rejects_identity_drift(tmp_path):
     identity = _paper_cup_identity()
     reference_image = tmp_path / "reference.png"
     reference_image.write_bytes(b"image")
@@ -312,53 +359,6 @@ def test_catalog_mode_rejects_reference_or_manifest_identity_drift(tmp_path):
 
     with pytest.raises(ValueError, match="object_id='obj_999'"):
         load_reference_annotation("paper_cup", index_path, expected_identity=identity)
-
-    image_dir = tmp_path / "rgb"
-    image_dir.mkdir()
-    Image.new("RGB", (10, 10)).save(image_dir / "0000.png")
-    manifest_path = tmp_path / "capture_manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "object_catalog": {"sha256": "different"},
-                "objects": {
-                    "paper_cup": {
-                        **identity.metadata(),
-                        "images": ["0000.png"],
-                    }
-                },
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="SHA-256"):
-        load_target_image_paths(
-            "paper_cup",
-            image_dir,
-            manifest_path,
-            expected_identity=identity,
-        )
-
-
-def test_target_image_cannot_escape_image_directory(tmp_path):
-    image_dir = tmp_path / "rgb"
-    image_dir.mkdir()
-    Image.new("RGB", (10, 10)).save(tmp_path / "outside.png")
-    manifest_path = tmp_path / "capture_manifest.json"
-    manifest_path.write_text(
-        json.dumps(
-            {
-                "objects": {
-                    "paper_cup": {"images": ["../outside.png"]},
-                }
-            }
-        ),
-        encoding="utf-8",
-    )
-
-    with pytest.raises(ValueError, match="relative to the dataset image directory"):
-        load_target_image_paths("paper_cup", image_dir, manifest_path)
 
 
 def test_dataset_mode_writes_canonical_highest_score_outputs_and_summary(tmp_path):

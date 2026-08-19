@@ -1,34 +1,12 @@
-## 공통 기능
+## Installation
 
 -
 
-
-## 기능 차이
-
-1. 가상환경 PCS 객체 분할 : 가상환경 기반 reference (image exemplar)로 단일 입력 이미지 객체 분할 (가능성 검증)
-2. Image Exemplar 라벨링 툴 :  실환경 reference BBox 생성 도구 (label_real_reference.py)
--> 사용 방법 : dataset-root/scene 지정 후 실행하면 Tkinter GUI가 열림. 마우스
-   드래그로 BBox를 그리면 즉시 저장되고 다음 미라벨링 object로 자동 이동. 이미
-   라벨링된 object를 다시 드래그하면 덮어쓰기 확인 팝업이 뜸.
-3. 실환경 PCS 객체 분할 : 실환경 기반 reference (image exemplar)로 다중 입력 이미지 객체 분할
-
-
-## 향후 작업
-
-1. Gemini 336L RGB-D 카메라 연동 및 SAM3 기반 실환경 객체 분할 적용성 검증
--> 카메라 종류를 인자로 설정 (갤럭시 / Gemini 등)
-2. Image Exemplar 라벨링 툴 에러 처리
-3. 가상환경 Image Stitching 기반 PCS 객체 분할 구현 - 다중 입력 지원
-4. 가상환경/실환경 공통화 모듈 및 어댑터 생성
-
-
-## install
-
--
-
-
+---
+ 
 ## Run
 
+### 1. 가상환경
 가상환경 단일 이미지 추론
 
 ```bash
@@ -41,20 +19,23 @@ python examples/cross_image_exemplar.py \
   --output-dir outputs/cross_image_exemplar
 ```
 
+### 2. 실환경
+
 실환경 key 정책
 
-- `/media/uon/data1/gemini/objects_metadata.csv`의 `Old_name`을 real pipeline의
+- `<dataset-root>/objects_metadata.csv`의 `Old_name`을 real pipeline의
   reference/manifest key로 사용한다. `Old_name`이 비어 있는 행만 `Object_name`으로
   fallback한다.
-- `--objects-metadata`를 지정하면 `--object-name`에는 CSV의 `Object_name`,
-  `Old_name`, `Class_name` 중 어느 값을 입력해도 같은 real key로 정규화된다.
-- reference index, BBox annotation, capture manifest가 모두 같은 catalog snapshot과
-  real key를 사용해야 한다.
+- label 툴과 추론기 둘 다 `--dataset-root`만 받고 `objects_metadata.csv`를 그 아래에서 자동으로 찾는다.
+- `Object_name`, `Old_name`, `Class_name` 중 어느 값을 입력해도 같은 real key로
+  정규화된다.
+- 추론기는 매 frame마다 CSV에서 identity를 새로 읽어 reference index/BBox
+  annotation과 대조하고, 어긋나면(예: CSV 변경) 해당 frame만 실패로 기록하고
+  나머지는 계속 처리한다. `capture_manifest.json`의 frame별 identity 필드는 이
+  검증에 쓰지 않는다 — frame은 `object_name`만 신뢰해서 reference를 찾는다.
 - catalog를 사용해 생성한 reference에는 `object_name`, `object_id`, `old_name`,
   `catalog_object_name`, `key_namespace`, `catalog_year`,
   `object_catalog_sha256`를 동일한 이름으로 기록한다.
-- `--objects-metadata`를 지정한 추론은 위 identity field와 catalog SHA-256을
-  reference index, BBox, capture manifest 사이에서 strict 검증한 뒤 시작한다.
 
 실환경 reference BBox 라벨링 (`reference-gen`의 객체별 고정 slot은 `0000.png`).
 `--dataset-root`/`--scene` 두 인자만 받는 Tkinter 대화형 GUI로,
@@ -68,30 +49,37 @@ python examples/label_real_reference.py \
   --scene real_v1/home/LivingRoom_Kitchen/dining_table
 ```
 
-실환경 이미지 전체 추론
+실환경 이미지 전체 추론. `--dataset-root`/`--scene` 두 인자만 받는다.
+`capture_manifest.json`의 `frames`를 capture_id 순서(0000 → 0001 → …)로 순회하면서 각 frame에 이미 기록된 object_name으로 reference를 자동 매칭하고, 그 frame에 등록된 카메라를 전부 처리한다.
 
 ```bash
 python examples/cross_image_exemplar_real.py \
-  --dataset-root /media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table \
-  --camera-name top_view_camera \
-  --object-name paper_cup \
-  --objects-metadata /media/uon/data1/gemini/objects_metadata.csv
+  --dataset-root /media/uon/data1/gemini \
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table
 ```
+
+frame마다 `bbox/<camera>/<id>.json` + `inst_seg/<camera>/<id>.png` +
+`inst_seg/<camera>/semantics_mapping_<id>.json` 세 파일이 모두 있으면 완료로 보고
+건너뛴다. 그래서 같은 명령을 재실행하면 중단된 지점부터 자동으로 이어서 처리되고,
+크래시나 Ctrl+C로 중단돼도 안전하다. object_name이 없는(unassigned) frame은 건너뛰고,
+frame 하나가 실패해도 전체 batch는 멈추지 않고 `inference_meta/sam3/errors.jsonl`에
+기록한 뒤 다음 frame으로 넘어간다. 특정 object만 처리하려면 `--object-name`으로
+필터링할 수 있다(완료 판정은 그대로 적용된다).
 
 Dataset mode는 다음 입력 위치를 고정 계약으로 사용한다.
 
 ```text
-/media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table/
-├── capture_manifest.json
-├── reference/reference_index.json
-└── rgb/top_view_camera/0000.png
+/media/uon/data1/gemini/
+├── objects_metadata.csv
+└── real_v1/home/LivingRoom_Kitchen/dining_table/
+    ├── capture_manifest.json
+    ├── reference/reference_index.json
+    └── rgb/top_view_camera/0000.png
 ```
 
-공유 catalog는 scene 밖의 `/media/uon/data1/gemini/objects_metadata.csv`를 사용한다.
-
-Manifest의 `objects.<applied_object>.images_by_camera.top_view_camera`를 먼저 읽고,
-해당 camera key가 없으면 기존 `objects.<applied_object>.images`를 fallback으로 읽는다.
-입력 RGB의 stem을 바꾸지 않고 다음 canonical output을 저장한다.
+Manifest의 `frames.<capture_id>.views.<camera>.files.rgb`를 읽어 대상 이미지를 찾고,
+같은 frame의 `object_name`으로 reference를 매칭한다. 입력 RGB의 stem을 바꾸지 않고
+다음 canonical output을 저장한다.
 
 ```text
 /media/uon/data1/gemini/real_v1/home/LivingRoom_Kitchen/dining_table/
@@ -115,12 +103,11 @@ Manifest의 `objects.<applied_object>.images_by_camera.top_view_camera`를 먼�
   `--no-save-diagnostics`를 추가한다.
 - Dataset mode는 `mask_000.png` 같은 개별 binary mask를 생성하지 않는다.
 
-위 라벨링과 추론 명령은 RGB-D 수집이 끝난 뒤 사용자가 명시적으로 실행하는 오프라인 단계다.
-현재 `scene-gen` viewer의 Set/Enter 동작이나 capture 버튼은 SAM3 추론을 자동으로
-실행하지 않는다. 향후 `Scene Gen` 버튼은 이미 수집된 manifest 기반 batch PCS를
-실행한다. 실증 camera stream을 즉시 처리하는 real-time PCS는 이 버튼과 별도의
-미구현 경로다.
+라벨링과 추론은 RGB-D 수집이 끝난 뒤 사용자가 명시적으로 실행하는 별도의 오프라인
+단계다 — `scene-gen`의 Set/Enter나 capture 버튼이 SAM3 추론을 자동으로 실행하지는
+않는다.
 
+---
 
 ## 테스트
 
@@ -130,9 +117,10 @@ AI가 코드 수정 후 회귀 확인용으로 만든 것. 평소 직접 실행�
 conda activate data_gen-inf && cd sam3 && python -m pytest tests/ -q
 ```
 
-- `test_cross_image_exemplar_real.py`: 좌표 변환/이미지 목록 선택/결과 저장 로직 (모델 추론 없음, GPU 불필요)
+- `test_cross_image_exemplar_real.py`: 좌표 변환/frame 순회·필터링/완료 판정/에러 로그/결과 저장 로직 (모델 추론 없음, GPU 불필요)
 - `test_real_object_catalog.py`: 객체 이름 해석, reference_index 갱신
 
+---
 
 ## Reference
 

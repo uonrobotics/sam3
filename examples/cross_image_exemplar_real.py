@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
-"""하나의 실환경 reference로 여러 실환경 이미지를 일괄 추론한다.
+"""Scene 전체 frame을 capture 순서대로 순회하며, frame마다 매칭된 실환경 reference로 일괄 추론한다.
 
-SAM 3에는 별도 이미지의 exemplar를 target에 직접 전달하는 공개 API가 없다.
-따라서 reference와 target을 종횡비가 보존된 1008x1008 canvas에 위아래로 배치하고,
+reference와 target을 종횡비가 보존된 1008x1008 canvas에 위아래로 배치하고,
 reference BBox를 동일 canvas의 positive geometric prompt로 제공한다.
+
+capture_manifest.json의 frame(capture_id) 순서로 순회한다:
+각 frame에 이미 기록된 object_name으로 reference를 자동 매칭하고, frame에 등록된 카메라를 전부 처리한다.
+이미 결과 3종(bbox/inst_seg/semantics_mapping)이 있는 frame은 건너뛰므로, 같은 명령을 재실행하면 중단된 지점부터 자동으로 이어서 처리된다.
 """
 
 from __future__ import annotations
@@ -15,6 +18,7 @@ from io import BytesIO
 import json
 import math
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 import re
@@ -31,12 +35,21 @@ from sam3.model_builder import build_sam3_image_model
 from sam3.visualization_utils import normalize_bbox
 
 if __package__:
-    from .real_object_catalog import RealObjectIdentity, resolve_optional_identity
+    from .real_object_catalog import (
+        RealObjectIdentity,
+        resolve_real_object,
+    )
 else:  # pragma: no cover - exercised by direct CLI execution
-    from real_object_catalog import RealObjectIdentity, resolve_optional_identity
+    from real_object_catalog import (
+        RealObjectIdentity,
+        resolve_real_object,
+    )
 
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
+_ANSI_RESET = "\033[0m"
+_ANSI_BOLD_GREEN = "\033[1;32m"
+_ANSI_BOLD_RED = "\033[1;31m"
 BACKGROUND_RGBA = (0, 0, 0, 0)
 UNLABELLED_RGBA = (0, 0, 0, 255)
 TARGET_RGBA = (255, 25, 25, 255)
@@ -66,34 +79,52 @@ class DatasetModePaths:
     summary_path: Path
 
 
+@dataclass(frozen=True)
+class FrameWorkItem:
+    capture_id: str
+    camera_name: str
+    object_name: str
+    rgb_relative_path: str
+
+
+@dataclass(frozen=True)
+class ReferenceBundle:
+    identity: RealObjectIdentity
+    object_id: str
+    reference_path: Path
+    reference_box: list[float]
+    reference_tile: Image.Image
+    reference_transform: LetterboxTransform
+    prompt_box: list[float]
+    normalized_prompt: list[float]
+
+
 def parse_args(argv: Sequence[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Batch SAM 3 inference using a stitched real-image exemplar."
+        description=(
+            "Batch SAM 3 inference over one scene, walking capture frames in "
+            "order and resuming automatically after a crash or interruption."
+        )
     )
-    parser.add_argument("--object-name", required=True)
     parser.add_argument(
         "--dataset-root",
         type=Path,
         required=True,
-        help=(
-            "Canonical Gemini dataset root. Inputs are read from "
-            "<root>/capture_manifest.json, <root>/reference/reference_index.json, "
-            "and <root>/rgb/<camera-name>; canonical outputs are written beneath "
-            "the same dataset root."
-        ),
+        help="Top-level dataset folder that holds objects_metadata.csv, e.g. "
+        "/media/uon/data1/gemini",
     )
     parser.add_argument(
-        "--camera-name",
-        default="top_view_camera",
-        help="Camera key used by dataset-mode images_by_camera and output paths.",
+        "--scene",
+        required=True,
+        help="Scene path relative to --dataset-root, e.g. "
+        "real_v1/home/LivingRoom_Kitchen/dining_table",
     )
     parser.add_argument(
-        "--objects-metadata",
-        type=Path,
+        "--object-name",
         help=(
-            "Optional objects_metadata.csv. When provided, Object_name, "
-            "Old_name, or Class_name input is normalized to the real pipeline "
-            "key (Old_name first, Object_name fallback)."
+            "Optional filter: only process frames whose recorded object_name "
+            "matches this catalog key. Frames already marked done are still "
+            "skipped; this only narrows which frames are visited."
         ),
     )
     parser.add_argument(
@@ -240,140 +271,6 @@ def load_reference_annotation(
     return reference_path, annotation
 
 
-def load_target_image_paths(
-    object_name: str,
-    image_dir: Path,
-    scene_meta_path: Path,
-    *,
-    expected_identity: RealObjectIdentity | None = None,
-    camera_name: str | None = None,
-) -> list[Path]:
-    """수집 metadata에서 해당 객체로 등록된 target 이미지만 반환한다."""
-    if not scene_meta_path.is_file():
-        raise FileNotFoundError(f"Capture manifest not found: {scene_meta_path}")
-    manifest = json.loads(scene_meta_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Capture manifest must be an object: {scene_meta_path}")
-    objects = manifest.get("objects")
-    if not isinstance(objects, dict):
-        raise ValueError(
-            f"Capture manifest must contain an objects mapping: {scene_meta_path}"
-        )
-    entry = objects.get(object_name)
-    if entry is None:
-        raise KeyError(
-            f"Object {object_name!r} not found in capture manifest {scene_meta_path}"
-        )
-    if not isinstance(entry, dict):
-        raise ValueError(
-            f"Capture manifest entry for {object_name!r} must be an object."
-        )
-    if expected_identity is not None:
-        catalog = manifest.get("object_catalog")
-        if not isinstance(catalog, dict):
-            raise ValueError(
-                "Capture manifest has no object_catalog provenance while "
-                "--objects-metadata is enabled."
-            )
-        manifest_hash = catalog.get("sha256")
-        if manifest_hash != expected_identity.object_catalog_sha256:
-            raise ValueError(
-                "Capture manifest object catalog SHA-256 does not match the "
-                "selected objects_metadata.csv: "
-                f"{manifest_hash!r} != "
-                f"{expected_identity.object_catalog_sha256!r}."
-            )
-        _validate_identity_metadata(
-            entry,
-            expected_identity,
-            source=f"capture manifest {scene_meta_path}",
-        )
-    image_names: object
-    used_legacy_images = True
-    images_by_camera = entry.get("images_by_camera")
-    if camera_name is not None and images_by_camera is not None:
-        if not isinstance(images_by_camera, dict):
-            raise ValueError(f"images_by_camera for {object_name!r} must be an object.")
-        if camera_name in images_by_camera:
-            image_names = images_by_camera[camera_name]
-            used_legacy_images = False
-        else:
-            image_names = entry.get("images", [])
-    else:
-        image_names = entry.get("images", [])
-    if not isinstance(image_names, list):
-        raise ValueError(f"Target images for {object_name!r} must be a list.")
-    if not all(isinstance(name, str) and name for name in image_names):
-        raise ValueError(
-            f"Target image names for {object_name!r} must be non-empty strings."
-        )
-    if camera_name is not None and used_legacy_images:
-        camera_relative_names: list[str] = []
-        for image_name in image_names:
-            relative_path = Path(image_name)
-            if relative_path.is_absolute() or ".." in relative_path.parts:
-                raise ValueError(
-                    f"Target image must be relative to the dataset image directory: {image_name!r}"
-                )
-            if len(relative_path.parts) == 1:
-                camera_relative_names.append(image_name)
-            elif relative_path.parts[0] == camera_name:
-                camera_relative_names.append(Path(*relative_path.parts[1:]).as_posix())
-        image_names = camera_relative_names
-    if not image_names:
-        camera_suffix = (
-            f" and camera {camera_name!r}" if camera_name is not None else ""
-        )
-        raise ValueError(
-            f"No target images registered for {object_name!r}{camera_suffix}"
-        )
-    if len(image_names) != len(set(image_names)):
-        raise ValueError(f"Duplicate target image names for {object_name!r}")
-
-    image_root = image_dir.resolve()
-    image_paths: list[Path] = []
-    for image_name in image_names:
-        relative_path = Path(image_name)
-        if relative_path.is_absolute() or ".." in relative_path.parts:
-            raise ValueError(
-                f"Target image must be relative to the dataset image directory: {image_name!r}"
-            )
-        image_path = (image_root / relative_path).resolve()
-        try:
-            image_path.relative_to(image_root)
-        except ValueError as exc:
-            raise ValueError(
-                f"Target image escapes the dataset image directory: {image_name!r}"
-            ) from exc
-        if not image_path.is_file():
-            raise FileNotFoundError(f"Target image not found: {image_path}")
-        if image_path.suffix.lower() not in IMAGE_SUFFIXES:
-            raise ValueError(f"Unsupported target image suffix: {image_path}")
-        image_paths.append(image_path)
-    return image_paths
-
-
-def load_manifest_object_entry(
-    object_name: str,
-    scene_meta_path: Path,
-) -> dict:
-    """Return one manifest object entry for dataset output identity metadata."""
-
-    if not scene_meta_path.is_file():
-        raise FileNotFoundError(f"Capture manifest not found: {scene_meta_path}")
-    manifest = json.loads(scene_meta_path.read_text(encoding="utf-8"))
-    if not isinstance(manifest, dict) or not isinstance(manifest.get("objects"), dict):
-        raise ValueError(
-            f"Capture manifest must contain an objects mapping: {scene_meta_path}"
-        )
-    entry = manifest["objects"].get(object_name)
-    if not isinstance(entry, dict):
-        raise KeyError(
-            f"Object {object_name!r} not found in capture manifest {scene_meta_path}"
-        )
-    return entry
-
-
 def _validate_identity_metadata(
     document: dict,
     identity: RealObjectIdentity,
@@ -388,6 +285,166 @@ def _validate_identity_metadata(
         actual = document[field]
         if actual != expected:
             raise ValueError(f"{source} has {field}={actual!r}; expected {expected!r}.")
+
+
+def discover_frame_work_items(
+    manifest: dict,
+    *,
+    object_name_filter: str | None,
+) -> list[FrameWorkItem]:
+    """capture_id 오름차순으로 (frame, camera) 작업 단위를 만든다.
+
+    object_name이 없는(unassigned) frame은 매칭할 reference가 없으므로 건너뛴다.
+    """
+    frames = manifest.get("frames")
+    if not isinstance(frames, dict):
+        raise ValueError("Capture manifest must contain a frames mapping.")
+
+    ordered_ids: list[tuple[int, str]] = []
+    for capture_id in frames:
+        try:
+            ordered_ids.append((int(capture_id), capture_id))
+        except ValueError:
+            print(
+                f"cross-image-exemplar-real: skipping malformed capture_id "
+                f"{capture_id!r}",
+                file=sys.stderr,
+            )
+    ordered_ids.sort()
+
+    items: list[FrameWorkItem] = []
+    for _, capture_id in ordered_ids:
+        frame = frames[capture_id]
+        if not isinstance(frame, dict):
+            continue
+        object_name = frame.get("object_name")
+        if not object_name:
+            continue  # unassigned diagnostic capture; nothing to match it to
+        if object_name_filter is not None and object_name != object_name_filter:
+            continue
+        views = frame.get("views")
+        if not isinstance(views, dict):
+            continue
+        for camera_name in sorted(views):
+            view = views[camera_name]
+            if not isinstance(view, dict):
+                continue
+            rgb_relative = (view.get("files") or {}).get("rgb")
+            if not rgb_relative:
+                continue
+            items.append(
+                FrameWorkItem(
+                    capture_id=capture_id,
+                    camera_name=camera_name,
+                    object_name=object_name,
+                    rgb_relative_path=rgb_relative,
+                )
+            )
+    return items
+
+
+def resolve_scene_relative_image(scene_root: Path, relative_value: str) -> Path:
+    """manifest가 준 rgb 경로는 신뢰하되, scene_root 밖으로는 못 나가게 막는다."""
+    relative_path = Path(relative_value)
+    if relative_path.is_absolute() or ".." in relative_path.parts:
+        raise ValueError(
+            f"Target image must be relative to the scene root: {relative_value!r}"
+        )
+    resolved_root = scene_root.resolve()
+    resolved = (resolved_root / relative_path).resolve()
+    try:
+        resolved.relative_to(resolved_root)
+    except ValueError as exc:
+        raise ValueError(
+            f"Target image escapes the scene root: {relative_value!r}"
+        ) from exc
+    if not resolved.is_file():
+        raise FileNotFoundError(f"Target image not found: {resolved}")
+    if resolved.suffix.lower() not in IMAGE_SUFFIXES:
+        raise ValueError(f"Unsupported target image suffix: {resolved}")
+    return resolved
+
+
+def frame_is_done(scene_root: Path, camera_name: str, capture_id: str) -> bool:
+    """세 결과 파일이 모두 있어야 완료로 본다 (부분 재개는 하지 않는다)."""
+    bbox_path = scene_root / "bbox" / camera_name / f"{capture_id}.json"
+    inst_seg_path = scene_root / "inst_seg" / camera_name / f"{capture_id}.png"
+    mapping_path = (
+        scene_root / "inst_seg" / camera_name / f"semantics_mapping_{capture_id}.json"
+    )
+    return bbox_path.is_file() and inst_seg_path.is_file() and mapping_path.is_file()
+
+
+def log_frame_error(
+    errors_path: Path,
+    *,
+    capture_id: str,
+    camera_name: str,
+    object_name: str,
+    error: Exception,
+) -> None:
+    """실패한 frame을 durable append-only 로그에 남긴다 (batch는 계속 진행)."""
+    errors_path.parent.mkdir(parents=True, exist_ok=True)
+    record = {
+        "logged_at_utc": datetime.now(timezone.utc).isoformat(),
+        "capture_id": capture_id,
+        "camera_name": camera_name,
+        "object_name": object_name,
+        "error_type": type(error).__name__,
+        "error_message": str(error),
+    }
+    with errors_path.open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps(record) + "\n")
+
+
+def load_reference_bundle(
+    object_name: str,
+    *,
+    reference_index_path: Path,
+    metadata_path: Path,
+    tile_width: int,
+    tile_height: int,
+    input_size: int,
+) -> ReferenceBundle:
+    """Reference를 찾아 identity와 함께 검증하고, letterbox/prompt까지 미리 만든다."""
+    identity = resolve_real_object(object_name, metadata_path)
+    reference_path, annotation = load_reference_annotation(
+        object_name,
+        reference_index_path,
+        expected_identity=identity,
+    )
+    if annotation.get("bbox_format") != "xyxy":
+        raise ValueError("The pilot implementation requires bbox_format='xyxy'.")
+    reference_box = [float(value) for value in annotation["bbox"]]
+    reference = load_oriented_rgb(reference_path)
+    expected_size = (annotation.get("image_width"), annotation.get("image_height"))
+    if None not in expected_size and reference.size != expected_size:
+        raise ValueError(
+            f"Reference size changed after labeling: JSON={expected_size}, "
+            f"current={reference.size}"
+        )
+
+    reference_tile, reference_transform = letterbox(reference, tile_width, tile_height)
+    prompt_box = map_box_to_canvas(reference_box, reference_transform, tile_y=0)
+    normalized_prompt = (
+        normalize_bbox(
+            box_xyxy_to_cxcywh(torch.tensor(prompt_box).view(1, 4)),
+            input_size,
+            input_size,
+        )
+        .flatten()
+        .tolist()
+    )
+    return ReferenceBundle(
+        identity=identity,
+        object_id=identity.object_id,
+        reference_path=reference_path,
+        reference_box=reference_box,
+        reference_tile=reference_tile,
+        reference_transform=reference_transform,
+        prompt_box=prompt_box,
+        normalized_prompt=normalized_prompt,
+    )
 
 
 def letterbox(
@@ -798,6 +855,13 @@ def finalize_dataset_summary(paths: DatasetModePaths, summary: dict) -> None:
     _atomic_write_json(paths.summary_path, summary)
 
 
+def _highlight(text: str, ansi_code: str) -> str:
+    """TTY에 출력될 때만 색을 입힌다 (파일로 리다이렉트되면 평문 그대로)."""
+    if not sys.stdout.isatty():
+        return text
+    return f"{ansi_code}{text}{_ANSI_RESET}"
+
+
 def _sha256_file(path: Path) -> str:
     digest = hashlib.sha256()
     with path.open("rb") as stream:
@@ -813,43 +877,30 @@ def main() -> None:
     if not torch.cuda.is_available():
         raise RuntimeError("SAM 3 real batch inference requires a CUDA GPU.")
 
-    identity = resolve_optional_identity(args.object_name, args.objects_metadata)
-    object_name = identity.applied_key if identity is not None else args.object_name
-    dataset_paths = dataset_mode_paths(args.dataset_root, args.camera_name, object_name)
-    image_dir = dataset_paths.image_dir
-    reference_index = dataset_paths.reference_index
-    scene_meta = dataset_paths.capture_manifest
-    reference_path, annotation = load_reference_annotation(
-        object_name,
-        reference_index,
-        expected_identity=identity,
-    )
-    if annotation.get("bbox_format") != "xyxy":
-        raise ValueError("The pilot implementation requires bbox_format='xyxy'.")
-    reference_box = [float(value) for value in annotation["bbox"]]
-    reference = load_oriented_rgb(reference_path)
-    expected_size = (annotation.get("image_width"), annotation.get("image_height"))
-    if None not in expected_size and reference.size != expected_size:
-        raise ValueError(
-            f"Reference size changed after labeling: JSON={expected_size}, "
-            f"current={reference.size}"
-        )
+    dataset_root = args.dataset_root.expanduser().resolve()
+    metadata_path = dataset_root / "objects_metadata.csv"
+    if not metadata_path.is_file():
+        raise FileNotFoundError(f"objects_metadata.csv not found: {metadata_path}")
 
-    image_paths = load_target_image_paths(
-        object_name,
-        image_dir,
-        scene_meta,
-        expected_identity=identity,
-        camera_name=dataset_paths.camera_name,
+    scene_root = (dataset_root / args.scene).resolve()
+    capture_manifest_path = scene_root / "capture_manifest.json"
+    if not capture_manifest_path.is_file():
+        raise FileNotFoundError(f"Capture manifest not found: {capture_manifest_path}")
+    manifest = json.loads(capture_manifest_path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ValueError(f"Capture manifest must be an object: {capture_manifest_path}")
+
+    work_items = discover_frame_work_items(
+        manifest, object_name_filter=args.object_name
     )
-    manifest_entry = load_manifest_object_entry(object_name, scene_meta)
-    object_id = (
-        identity.object_id if identity is not None else manifest_entry.get("object_id")
-    )
-    if not isinstance(object_id, str):
+    if args.object_name is not None and not work_items:
         raise ValueError(
-            f"Dataset-mode manifest object {object_name!r} has no object_id."
+            f"No frames found for object {args.object_name!r} in "
+            f"{capture_manifest_path}"
         )
+    if not work_items:
+        print(f"No frames to process in {scene_root}")
+        return
 
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
@@ -865,91 +916,143 @@ def main() -> None:
 
     tile_width = args.input_size
     tile_height = args.input_size // 2
-    reference_tile, reference_transform = letterbox(reference, tile_width, tile_height)
-    prompt_box = map_box_to_canvas(reference_box, reference_transform, tile_y=0)
-    normalized_prompt = (
-        normalize_bbox(
-            box_xyxy_to_cxcywh(torch.tensor(prompt_box).view(1, 4)),
-            args.input_size,
-            args.input_size,
-        )
-        .flatten()
-        .tolist()
-    )
+    reference_index_path = scene_root / "reference" / "reference_index.json"
+    errors_path = scene_root / "inference_meta" / "sam3" / "errors.jsonl"
 
-    summary = build_dataset_summary(
-        paths=dataset_paths,
-        object_name=object_name,
-        object_id=object_id,
-        requested_object_name=args.object_name,
-        identity=identity,
-        manifest_entry=manifest_entry,
-        reference_path=reference_path,
-        reference_box=reference_box,
-        input_size=args.input_size,
-        confidence_threshold=args.confidence_threshold,
-        checkpoint=args.checkpoint,
-        save_diagnostics=args.save_diagnostics,
-    )
+    reference_cache: dict[str, ReferenceBundle] = {}
+    identity_failures: dict[str, Exception] = {}
+    summaries: dict[tuple[str, str], dict] = {}
 
-    for target_path in image_paths:
-        target = load_oriented_rgb(target_path)
-        target_tile, target_transform = letterbox(target, tile_width, tile_height)
-        canvas = Image.new("RGB", (args.input_size, args.input_size), (0, 0, 0))
-        canvas.paste(reference_tile, (0, 0))
-        canvas.paste(target_tile, (0, tile_height))
+    processed = skipped = failed = 0
 
-        prompt_preview = None
-        if args.save_diagnostics:
-            prompt_preview = canvas.copy()
-            ImageDraw.Draw(prompt_preview).rectangle(
-                prompt_box, outline=(0, 255, 0), width=4
+    for item in work_items:
+        if frame_is_done(scene_root, item.camera_name, item.capture_id):
+            skipped += 1
+            continue
+        try:
+            if item.object_name in identity_failures:
+                raise identity_failures[item.object_name]
+            bundle = reference_cache.get(item.object_name)
+            if bundle is None:
+                try:
+                    bundle = load_reference_bundle(
+                        item.object_name,
+                        reference_index_path=reference_index_path,
+                        metadata_path=metadata_path,
+                        tile_width=tile_width,
+                        tile_height=tile_height,
+                        input_size=args.input_size,
+                    )
+                except Exception as exc:
+                    identity_failures[item.object_name] = exc
+                    raise
+                reference_cache[item.object_name] = bundle
+
+            paths = dataset_mode_paths(scene_root, item.camera_name, item.object_name)
+            target_path = resolve_scene_relative_image(
+                scene_root, item.rgb_relative_path
+            )
+            target = load_oriented_rgb(target_path)
+            target_tile, target_transform = letterbox(target, tile_width, tile_height)
+            canvas = Image.new("RGB", (args.input_size, args.input_size), (0, 0, 0))
+            canvas.paste(bundle.reference_tile, (0, 0))
+            canvas.paste(target_tile, (0, tile_height))
+
+            prompt_preview = None
+            if args.save_diagnostics:
+                prompt_preview = canvas.copy()
+                ImageDraw.Draw(prompt_preview).rectangle(
+                    bundle.prompt_box, outline=(0, 255, 0), width=4
+                )
+
+            with torch.inference_mode(), torch.autocast(
+                device_type="cuda", dtype=torch.bfloat16
+            ):
+                state = processor.set_image(canvas)
+                output = processor.add_geometric_prompt(
+                    state=state, box=bundle.normalized_prompt, label=True
+                )
+
+            boxes = output["boxes"]
+            masks = output["masks"]
+            scores = output["scores"]
+            centers_y = (boxes[:, 1] + boxes[:, 3]) / 2
+            keep_target = centers_y >= tile_height
+            target_canvas_boxes = boxes[keep_target]
+            target_boxes = map_boxes_to_original(
+                target_canvas_boxes, target_transform, tile_y=tile_height
+            )
+            target_masks = restore_masks(
+                masks[keep_target],
+                target_transform,
+                tile_height,
+                tile_height,
+                args.input_size,
+            )
+            target_scores = scores[keep_target]
+            frame_result = save_dataset_results(
+                target,
+                target_masks,
+                target_boxes,
+                target_scores,
+                paths=paths,
+                frame_stem=item.capture_id,
+                object_name=item.object_name,
+                object_id=bundle.object_id,
+                source_image=target_path,
+                prompt_preview=prompt_preview,
+                save_diagnostics=args.save_diagnostics,
             )
 
-        with torch.inference_mode(), torch.autocast(
-            device_type="cuda", dtype=torch.bfloat16
-        ):
-            state = processor.set_image(canvas)
-            output = processor.add_geometric_prompt(
-                state=state, box=normalized_prompt, label=True
+            summary_key = (item.camera_name, item.object_name)
+            if summary_key not in summaries:
+                summaries[summary_key] = build_dataset_summary(
+                    paths=paths,
+                    object_name=item.object_name,
+                    object_id=bundle.object_id,
+                    requested_object_name=item.object_name,
+                    identity=bundle.identity,
+                    manifest_entry={},
+                    reference_path=bundle.reference_path,
+                    reference_box=bundle.reference_box,
+                    input_size=args.input_size,
+                    confidence_threshold=args.confidence_threshold,
+                    checkpoint=args.checkpoint,
+                    save_diagnostics=args.save_diagnostics,
+                )
+            summaries[summary_key]["images"].append(frame_result)
+
+            processed += 1
+            print(
+                f"{item.capture_id} [{item.camera_name}] {item.object_name}: "
+                f"{frame_result['prediction_count']} prediction(s)"
             )
+        except Exception as exc:  # noqa: BLE001 - per-frame isolation is required
+            failed += 1
+            log_frame_error(
+                errors_path,
+                capture_id=item.capture_id,
+                camera_name=item.camera_name,
+                object_name=item.object_name,
+                error=exc,
+            )
+            print(
+                f"{item.capture_id} [{item.camera_name}] {item.object_name}: "
+                f"FAILED ({exc}); logged to {errors_path}",
+                file=sys.stderr,
+            )
+            continue
 
-        boxes = output["boxes"]
-        masks = output["masks"]
-        scores = output["scores"]
-        centers_y = (boxes[:, 1] + boxes[:, 3]) / 2
-        keep_target = centers_y >= tile_height
-        target_canvas_boxes = boxes[keep_target]
-        target_boxes = map_boxes_to_original(
-            target_canvas_boxes, target_transform, tile_y=tile_height
+    for (camera_name, object_name), summary in summaries.items():
+        finalize_dataset_summary(
+            dataset_mode_paths(scene_root, camera_name, object_name), summary
         )
-        target_masks = restore_masks(
-            masks[keep_target],
-            target_transform,
-            tile_height,
-            tile_height,
-            args.input_size,
-        )
-        target_scores = scores[keep_target]
-        frame_result = save_dataset_results(
-            target,
-            target_masks,
-            target_boxes,
-            target_scores,
-            paths=dataset_paths,
-            frame_stem=target_path.stem,
-            object_name=object_name,
-            object_id=object_id,
-            source_image=target_path,
-            prompt_preview=prompt_preview,
-            save_diagnostics=args.save_diagnostics,
-        )
-        summary["images"].append(frame_result)
-        prediction_count = frame_result["prediction_count"]
-        print(f"{target_path.name}: {prediction_count} prediction(s)")
 
-    finalize_dataset_summary(dataset_paths, summary)
-    print(f"Saved canonical dataset results to {dataset_paths.root}")
+    summary_line = (
+        f"Processed {processed}, skipped {skipped} already-done, {failed} failed "
+        f"(of {len(work_items)} frame(s)). Scene: {scene_root}"
+    )
+    print(_highlight(summary_line, _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN))
 
 
 if __name__ == "__main__":
