@@ -195,7 +195,7 @@ def test_frame_is_done_requires_all_three_output_files(tmp_path):
 
 
 def test_log_frame_error_appends_jsonl_records(tmp_path):
-    errors_path = tmp_path / "inference_meta" / "errors.jsonl"
+    errors_path = tmp_path / "inference_meta" / "sam3" / "errors.jsonl"
     log_frame_error(
         errors_path,
         capture_id="0000",
@@ -398,9 +398,9 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_inference_meta(
     mapping_path = (
         tmp_path / "inst_seg" / "top_view_camera" / "semantics_mapping_0007.json"
     )
-    overlay_dir = tmp_path / "diagnostics" / "top_view_camera" / "overlay"
+    overlay_dir = tmp_path / "diagnostics" / "sam3" / "top_view_camera" / "overlay"
     stitched_dir = (
-        tmp_path / "diagnostics" / "top_view_camera" / "stitched_prompt"
+        tmp_path / "diagnostics" / "sam3" / "top_view_camera" / "stitched_prompt"
     )
     assert json.loads(bbox_path.read_text(encoding="utf-8")) == {
         "obj_120": [2, 0, 6, 4]
@@ -429,12 +429,12 @@ def test_dataset_mode_writes_canonical_highest_score_outputs_and_inference_meta(
         "bbox": "bbox/top_view_camera/0007.json",
         "inst_seg": "inst_seg/top_view_camera/0007.png",
         "semantics_mapping": ("inst_seg/top_view_camera/semantics_mapping_0007.json"),
-        "overlay": "diagnostics/top_view_camera/overlay/0007.jpg",
-        "stitched_prompt": "diagnostics/top_view_camera/stitched_prompt/0007.jpg",
+        "overlay": "diagnostics/sam3/top_view_camera/overlay/0007.jpg",
+        "stitched_prompt": "diagnostics/sam3/top_view_camera/stitched_prompt/0007.jpg",
     }
 
     inference_meta_path = (
-        tmp_path / "inference_meta" / "top_view_camera" / "0007.json"
+        tmp_path / "inference_meta" / "sam3" / "top_view_camera" / "0007.json"
     )
     written_meta = json.loads(inference_meta_path.read_text(encoding="utf-8"))
     assert written_meta == frame_result
@@ -478,7 +478,7 @@ def test_dataset_mode_overlay_draws_only_the_selected_prediction(tmp_path):
 
     assert frame_result["selected_prediction_index"] == 1
     overlay_path = (
-        tmp_path / "diagnostics" / "top_view_camera" / "overlay" / "0007.jpg"
+        tmp_path / "diagnostics" / "sam3" / "top_view_camera" / "overlay" / "0007.jpg"
     )
     with Image.open(overlay_path) as opened:
         overlay = np.asarray(opened.convert("RGB")).astype(int)

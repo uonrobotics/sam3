@@ -169,11 +169,13 @@ def dataset_mode_paths(
         capture_manifest=root / "capture_manifest.json",
         bbox_dir=root / "bbox" / camera_component,
         inst_seg_dir=root / "inst_seg" / camera_component,
-        diagnostics_overlay_dir=root / "diagnostics" / camera_component / "overlay",
-        diagnostics_stitched_dir=(
-            root / "diagnostics" / camera_component / "stitched_prompt"
+        diagnostics_overlay_dir=(
+            root / "diagnostics" / "sam3" / camera_component / "overlay"
         ),
-        inference_meta_dir=root / "inference_meta" / camera_component,
+        diagnostics_stitched_dir=(
+            root / "diagnostics" / "sam3" / camera_component / "stitched_prompt"
+        ),
+        inference_meta_dir=root / "inference_meta" / "sam3" / camera_component,
     )
 
 
@@ -829,7 +831,7 @@ def main() -> None:
     tile_width = args.input_size
     tile_height = args.input_size // 2
     reference_index_path = scene_root / "reference" / "reference_index.json"
-    errors_path = scene_root / "inference_meta" / "errors.jsonl"
+    errors_path = scene_root / "inference_meta" / "sam3" / "errors.jsonl"
 
     reference_cache: dict[str, ReferenceBundle] = {}
     identity_failures: dict[str, Exception] = {}
