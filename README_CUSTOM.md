@@ -33,7 +33,7 @@ python examples/cross_image_exemplar.py \
 - `<dataset-root>/objects_metadata.csv`의 `Old_name`을 real pipeline의
   reference/manifest key로 사용한다. `Old_name`이 비어 있는 행만 `Object_name`으로
   fallback한다.
-- label 툴과 추론기 둘 다 `--dataset-root`만 받고 `objects_metadata.csv`를 그 아래에서 자동으로 찾는다.
+- label 툴과 추론기 둘 다 기본은 `--dataset-root` 아래 `objects_metadata.csv`를 자동으로 찾고, `--objects-metadata`로 다른 카탈로그 경로(예: 24/25/26년도를 합친 `objects_metadata_merged.csv`)를 지정할 수 있다.
 - `Object_name`, `Old_name`, `Class_name` 중 어느 값을 입력해도 같은 real key로
   정규화된다.
 - 추론기는 매 frame마다 CSV에서 identity를 새로 읽어 reference index/BBox
@@ -53,7 +53,8 @@ python examples/cross_image_exemplar.py \
 ```bash
 python examples/label_real_reference.py \
   --dataset-root /media/uon/data1/gemini \
-  --scene real_v1/home/LivingRoom_Kitchen/dining_table
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table \
+  --objects-metadata /media/uon/data1/gemini/objects_metadata_merged.csv
 ```
 
 실환경 이미지 전체 추론. `--dataset-root`/`--scene` 두 인자만 받는다.
@@ -62,7 +63,8 @@ python examples/label_real_reference.py \
 ```bash
 python examples/cross_image_exemplar_real.py \
   --dataset-root /media/uon/data1/gemini \
-  --scene real_v1/home/LivingRoom_Kitchen/dining_table
+  --scene real_v1/home/LivingRoom_Kitchen/dining_table \
+  --objects-metadata /media/uon/data1/gemini/objects_metadata_merged.csv
 ```
 
 frame마다 `bbox/<camera>/<id>.json` + `inst_seg/<camera>/<id>.png` +

@@ -58,6 +58,13 @@ def parse_args() -> argparse.Namespace:
         "real_v1/home/LivingRoom_Kitchen/dining_table",
     )
     parser.add_argument(
+        "--objects-metadata",
+        type=Path,
+        default=None,
+        help="Override the catalog CSV path (default: "
+        "<dataset-root>/objects_metadata.csv).",
+    )
+    parser.add_argument(
         "--max-display-size",
         type=int,
         default=900,
@@ -500,7 +507,11 @@ def main() -> None:
     args = parse_args()
     try:
         dataset_root = args.dataset_root.expanduser().resolve()
-        metadata_path = dataset_root / "objects_metadata.csv"
+        metadata_path = (
+            args.objects_metadata.expanduser().resolve()
+            if args.objects_metadata is not None
+            else dataset_root / "objects_metadata.csv"
+        )
         if not metadata_path.is_file():
             raise FileNotFoundError(f"objects_metadata.csv not found: {metadata_path}")
 
