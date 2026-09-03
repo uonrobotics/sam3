@@ -246,6 +246,10 @@ class LabelingApp:
             nav, text="▶", width=3, command=lambda: self._set_index(self.index + 1)
         )
         self.next_button.pack(side="left", padx=(2, 0))
+        self.root.bind("<Return>", lambda _event: self._set_index(self.index + 1))
+        self.root.bind("<Escape>", lambda _event: self.root.destroy())
+        self.root.bind("q", lambda _event: self.root.destroy())
+        self.root.bind("Q", lambda _event: self.root.destroy())
         self.scale_var = tk.DoubleVar()
         self.scale = ttk.Scale(
             nav,
