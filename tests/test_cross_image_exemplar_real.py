@@ -115,12 +115,8 @@ def test_parse_args_accepts_optional_object_name_filter():
     assert args.object_name == "mouse"
 
 
-def _frame(object_name, views):
-    return {"object_name": object_name, "views": views}
-
-
-def _view(rgb_path):
-    return {"files": {"rgb": rgb_path}}
+def _frame(object_name, camera_names):
+    return {"object_name": object_name, "views": camera_names}
 
 
 def test_discover_frame_work_items_orders_by_capture_id_as_integer():
@@ -128,9 +124,9 @@ def test_discover_frame_work_items_orders_by_capture_id_as_integer():
     # numerically once a scene passes 9999 frames.
     manifest = {
         "frames": {
-            "10000": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/10000.png")}),
-            "9999": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/9999.png")}),
-            "0001": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
+            "10000": _frame("mouse", ["top_view_camera"]),
+            "9999": _frame("mouse", ["top_view_camera"]),
+            "0001": _frame("mouse", ["top_view_camera"]),
         }
     }
     items = discover_frame_work_items(manifest, object_name_filter=None)
@@ -140,8 +136,8 @@ def test_discover_frame_work_items_orders_by_capture_id_as_integer():
 def test_discover_frame_work_items_skips_unassigned_frames():
     manifest = {
         "frames": {
-            "0000": _frame(None, {"top_view_camera": _view("rgb/top_view_camera/0000.png")}),
-            "0001": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
+            "0000": _frame(None, ["top_view_camera"]),
+            "0001": _frame("mouse", ["top_view_camera"]),
         }
     }
     items = discover_frame_work_items(manifest, object_name_filter=None)
@@ -151,8 +147,8 @@ def test_discover_frame_work_items_skips_unassigned_frames():
 def test_discover_frame_work_items_filters_by_object_name():
     manifest = {
         "frames": {
-            "0000": _frame("mouse", {"top_view_camera": _view("rgb/top_view_camera/0000.png")}),
-            "0001": _frame("cereal_snack", {"top_view_camera": _view("rgb/top_view_camera/0001.png")}),
+            "0000": _frame("mouse", ["top_view_camera"]),
+            "0001": _frame("cereal_snack", ["top_view_camera"]),
         }
     }
     items = discover_frame_work_items(manifest, object_name_filter="cereal_snack")
@@ -163,13 +159,7 @@ def test_discover_frame_work_items_filters_by_object_name():
 def test_discover_frame_work_items_visits_every_camera_in_a_frame():
     manifest = {
         "frames": {
-            "0000": _frame(
-                "mouse",
-                {
-                    "top_view_camera": _view("rgb/top_view_camera/0000.png"),
-                    "side_view_camera": _view("rgb/side_view_camera/0000.png"),
-                },
-            ),
+            "0000": _frame("mouse", ["top_view_camera", "side_view_camera"]),
         }
     }
     items = discover_frame_work_items(manifest, object_name_filter=None)

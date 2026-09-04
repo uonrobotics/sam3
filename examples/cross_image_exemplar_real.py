@@ -325,15 +325,12 @@ def discover_frame_work_items(
         if object_name_filter is not None and object_name != object_name_filter:
             continue
         views = frame.get("views")
-        if not isinstance(views, dict):
+        if not isinstance(views, list):
             continue
         for camera_name in sorted(views):
-            view = views[camera_name]
-            if not isinstance(view, dict):
+            if not isinstance(camera_name, str):
                 continue
-            rgb_relative = (view.get("files") or {}).get("rgb")
-            if not rgb_relative:
-                continue
+            rgb_relative = f"rgb/{camera_name}/{capture_id}.png"
             items.append(
                 FrameWorkItem(
                     capture_id=capture_id,
@@ -346,7 +343,7 @@ def discover_frame_work_items(
 
 
 def resolve_scene_relative_image(scene_root: Path, relative_value: str) -> Path:
-    """manifest가 준 rgb 경로는 신뢰하되, scene_root 밖으로는 못 나가게 막는다."""
+    """디렉터리 규칙으로 계산한 rgb 경로가 scene_root 밖으로는 못 나가게 막는다."""
     relative_path = Path(relative_value)
     if relative_path.is_absolute() or ".." in relative_path.parts:
         raise ValueError(
