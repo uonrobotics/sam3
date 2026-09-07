@@ -167,7 +167,7 @@ def test_discover_frame_work_items_visits_every_camera_in_a_frame():
     assert all(item.capture_id == "0000" and item.object_name == "mouse" for item in items)
 
 
-def test_frame_is_done_requires_all_three_output_files(tmp_path):
+def test_frame_is_done_requires_all_four_output_files(tmp_path):
     assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
 
     bbox_dir = tmp_path / "bbox" / "top_view_camera"
@@ -181,6 +181,11 @@ def test_frame_is_done_requires_all_three_output_files(tmp_path):
     assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
 
     (inst_seg_dir / "semantics_mapping_0000.json").write_text("{}")
+    assert frame_is_done(tmp_path, "top_view_camera", "0000") is False
+
+    inference_meta_dir = tmp_path / "inference_meta" / "sam3" / "top_view_camera"
+    inference_meta_dir.mkdir(parents=True)
+    (inference_meta_dir / "0000.json").write_text("{}")
     assert frame_is_done(tmp_path, "top_view_camera", "0000") is True
 
 
@@ -523,3 +528,35 @@ def test_dataset_mode_no_predictions_writes_unlabelled_mask_without_diagnostics(
     assert "overlay" not in result["artifacts"]
     assert not (tmp_path / "diagnostics").exists()
     assert not list(tmp_path.rglob("mask_*.png"))
+
+
+def test_dataset_mode_no_predictions_skips_diagnostics_even_when_enabled(tmp_path):
+    paths = dataset_mode_paths(tmp_path, "top_view_camera")
+    source_image = tmp_path / "rgb" / "top_view_camera" / "0009.png"
+    source_image.parent.mkdir(parents=True)
+    target = Image.new("RGB", (5, 3), (255, 255, 255))
+    target.save(source_image)
+
+    result = save_dataset_results(
+        target,
+        [],
+        torch.empty((0, 4), dtype=torch.float32),
+        torch.empty((0,), dtype=torch.float32),
+        paths=paths,
+        frame_stem="0009",
+        object_name="paper_cup",
+        object_id="obj_120",
+        source_image=source_image,
+        prompt_preview=Image.new("RGB", (8, 8), (0, 0, 0)),
+        save_diagnostics=True,
+    )
+
+    assert result["status"] == "no_predictions"
+    assert "overlay" not in result["artifacts"]
+    assert "stitched_prompt" not in result["artifacts"]
+    assert not (tmp_path / "diagnostics").exists()
+
+    inference_meta_path = (
+        tmp_path / "inference_meta" / "sam3" / "top_view_camera" / "0009.json"
+    )
+    assert json.loads(inference_meta_path.read_text(encoding="utf-8")) == result

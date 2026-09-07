@@ -68,8 +68,8 @@ python examples/cross_image_exemplar_real.py \
 ```
 
 frame마다 `bbox/<camera>/<id>.json` + `inst_seg/<camera>/<id>.png` +
-`inst_seg/<camera>/semantics_mapping_<id>.json` 세 파일이 모두 있으면 완료로 보고
-건너뛴다. 그래서 같은 명령을 재실행하면 중단된 지점부터 자동으로 이어서 처리되고,
+`inst_seg/<camera>/semantics_mapping_<id>.json` + `inference_meta/sam3/<camera>/<id>.json`
+네 파일이 모두 있으면 완료로 보고 건너뛴다. 그래서 같은 명령을 재실행하면 중단된 지점부터 자동으로 이어서 처리되고,
 크래시나 Ctrl+C로 중단돼도 안전하다. object_name이 없는(unassigned) frame은 건너뛰고,
 frame 하나가 실패해도 전체 batch는 멈추지 않고 `inference_meta/sam3/errors.jsonl`에
 기록한 뒤 다음 frame으로 넘어간다. 특정 object만 처리하려면 `--object-name`으로
@@ -112,12 +112,14 @@ Manifest의 `frames.<capture_id>.views.<camera>.files.rgb`를 읽어 대상 이�
   `(255, 25, 25, 255)`, 나머지는 opaque black `UNLABELLED`이다. 색과
   `Class_name`의 관계는 같은 stem의 `semantics_mapping_*.json`이 정의한다.
 - `inference_meta/sam3/<camera>/NNNN.json`에는 선택 여부를 포함한 모든 candidate와
-  score를 frame 단위로 기록한다(`bbox`/`inst_seg`엔 선택된 결과만 남으므로, 왜 이
-  결과가 나왔는지 볼 때 참고). `inference_meta/sam3/errors.jsonl`은 처리 실패한
-  frame을 append 방식으로 기록한다.
-- overlay와 stitched prompt는 `bbox`/`inst_seg`처럼 capture ID 순서대로 저장되므로
-  이미지 뷰어로 순서대로 넘겨보며 라벨링 결과를 검수할 수 있다. 선택적 diagnostic이라
-  저장하지 않으려면
+  score, 그리고 이 frame에서 뭔가 찾았는지(`status`: `ok`/`no_predictions`)를 frame
+  단위로 기록한다(`bbox`/`inst_seg`엔 선택된 결과만 남으므로, 왜 이 결과가 나왔는지
+  볼 때 참고 - FoundationPose도 이 status를 그대로 읽어서 "SAM3가 애초에 못 찾은
+  frame"을 판단한다). `inference_meta/sam3/errors.jsonl`은 처리 실패한 frame을
+  append 방식으로 기록한다.
+- overlay와 stitched prompt는 뭔가 찾은 frame에 한해 `bbox`/`inst_seg`처럼 capture
+  ID 순서대로 저장된다(no detection인 frame은 저장 안 함 - 아무 표시도 없는 원본
+  사진만 남기지 않기 위해서). 선택적 diagnostic이라 저장하지 않으려면
   `--no-save-diagnostics`를 추가한다.
 - Dataset mode는 `mask_000.png` 같은 개별 binary mask를 생성하지 않는다.
 

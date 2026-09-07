@@ -50,6 +50,7 @@ IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff"}
 _ANSI_RESET = "\033[0m"
 _ANSI_BOLD_GREEN = "\033[1;32m"
 _ANSI_BOLD_RED = "\033[1;31m"
+_ANSI_BOLD_YELLOW = "\033[1;33m"
 BACKGROUND_RGBA = (0, 0, 0, 0)
 UNLABELLED_RGBA = (0, 0, 0, 255)
 TARGET_RGBA = (255, 25, 25, 255)
@@ -365,13 +366,27 @@ def resolve_scene_relative_image(scene_root: Path, relative_value: str) -> Path:
 
 
 def frame_is_done(scene_root: Path, camera_name: str, capture_id: str) -> bool:
-    """세 결과 파일이 모두 있어야 완료로 본다 (부분 재개는 하지 않는다)."""
+    """네 결과 파일이 모두 있어야 완료로 본다.
+
+    inference_meta는 save_dataset_results()가 마지막에 쓰는 파일이라, 이것까지
+    확인해야 bbox/inst_seg/mapping만 쓰고 죽은 중간 상태를 "완료"로 오판하지
+    않는다 (그렇게 오판하면 inference_meta 없이 영구히 스킵돼 FoundationPose가
+    status를 못 읽는다).
+    """
     bbox_path = scene_root / "bbox" / camera_name / f"{capture_id}.json"
     inst_seg_path = scene_root / "inst_seg" / camera_name / f"{capture_id}.png"
     mapping_path = (
         scene_root / "inst_seg" / camera_name / f"semantics_mapping_{capture_id}.json"
     )
-    return bbox_path.is_file() and inst_seg_path.is_file() and mapping_path.is_file()
+    inference_meta_path = (
+        scene_root / "inference_meta" / "sam3" / camera_name / f"{capture_id}.json"
+    )
+    return (
+        bbox_path.is_file()
+        and inst_seg_path.is_file()
+        and mapping_path.is_file()
+        and inference_meta_path.is_file()
+    )
 
 
 def log_frame_error(
@@ -583,14 +598,15 @@ def save_dataset_results(
         str(TARGET_RGBA): {"class": object_id},
     }
     overlay: Image.Image | None = None
-    if save_diagnostics:
+    if save_diagnostics and selected_index is not None:
         # Diagnostics mirrors inst_seg/bbox: draw only the selected
-        # (highest-score) prediction, not every raw candidate in the target
-        # region.
-        selected_masks = [masks[selected_index]] if selected_index is not None else []
-        selected_candidates = (
-            [candidates[selected_index]] if selected_index is not None else []
-        )
+        # (highest-score) prediction. No detection means nothing to
+        # highlight, so skip diagnostics entirely rather than publish a
+        # plain, unannotated copy of the target image (matches
+        # FoundationPose, which likewise writes nothing when it has no
+        # detection to visualize).
+        selected_masks = [masks[selected_index]]
+        selected_candidates = [candidates[selected_index]]
         overlay = _render_dataset_overlay(target, selected_masks, selected_candidates)
 
     _atomic_write_json(bbox_path, bbox_document)
@@ -598,7 +614,7 @@ def save_dataset_results(
     _atomic_write_json(mapping_path, mapping_document)
 
     diagnostic_paths: dict[str, str] = {}
-    if save_diagnostics:
+    if save_diagnostics and selected_index is not None:
         assert prompt_preview is not None  # validated before publishing artifacts
         assert overlay is not None
         overlay_path = paths.diagnostics_overlay_dir / f"{frame_component}.jpg"
@@ -844,7 +860,7 @@ def main() -> None:
     reference_cache: dict[str, ReferenceBundle] = {}
     identity_failures: dict[str, Exception] = {}
 
-    processed = skipped = failed = 0
+    processed = skipped = no_detection = failed = 0
 
     for item in work_items:
         if frame_is_done(scene_root, item.camera_name, item.capture_id):
@@ -925,7 +941,10 @@ def main() -> None:
                 save_diagnostics=args.save_diagnostics,
             )
 
-            processed += 1
+            if frame_result["status"] == "ok":
+                processed += 1
+            else:
+                no_detection += 1
             print(
                 f"{item.capture_id} [{item.camera_name}] {item.object_name}: "
                 f"{frame_result['prediction_count']} prediction(s)"
@@ -946,11 +965,22 @@ def main() -> None:
             )
             continue
 
-    summary_line = (
-        f"Processed {processed}, skipped {skipped} already-done, {failed} failed "
-        f"(of {len(work_items)} frame(s)). Scene: {scene_root}"
+    processed_part = _highlight(f"Processed {processed}", _ANSI_BOLD_GREEN)
+    no_detection_part = _highlight(
+        f"no detection {no_detection}",
+        _ANSI_BOLD_YELLOW if no_detection else _ANSI_BOLD_GREEN,
     )
-    print(_highlight(summary_line, _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN))
+    skipped_part = _highlight(
+        f"skipped {skipped} already-done",
+        _ANSI_BOLD_YELLOW if skipped else _ANSI_BOLD_GREEN,
+    )
+    failed_part = _highlight(
+        f"failed {failed}", _ANSI_BOLD_RED if failed else _ANSI_BOLD_GREEN
+    )
+    tail = _highlight(
+        f"(of {len(work_items)} frame(s)). Scene: {scene_root}", _ANSI_BOLD_GREEN
+    )
+    print(f"{processed_part}, {no_detection_part}, {skipped_part}, {failed_part} {tail}")
 
 
 if __name__ == "__main__":
