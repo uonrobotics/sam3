@@ -139,6 +139,7 @@ conda activate data_gen-inf && cd sam3 && python -m pytest tests/ -q
 
 - `test_cross_image_exemplar_real.py`: 좌표 변환/frame 순회·필터링/완료 판정/에러 로그/결과 저장 로직 (모델 추론 없음, GPU 불필요)
 - `test_real_object_catalog.py`: 객체 이름 해석, reference_index 갱신
+- `test_recover_no_detection_frames.py`: no-detection 복구용 씬 탐색/레퍼런스 풀 구성/재시도 대상 판정/recovery 메타데이터 기록 (모델 추론 없음, GPU 불필요)
 
 ---
 
