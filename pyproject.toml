@@ -36,6 +36,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+tiptop-server = ["pillow", "einops", "psutil", "opencv-python"]
 dev = [
     "pytest",
     "pytest-cov",
