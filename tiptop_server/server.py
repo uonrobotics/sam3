@@ -12,8 +12,10 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
 ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_REFERENCE_ROOT = Path("/media/uon/data1/Dataset_2026/review/real_v1")
-DEFAULT_METADATA = DEFAULT_REFERENCE_ROOT.parent / "2026_real_world_test_objects_metadata.csv"
+DEFAULT_REFERENCE_ROOT = Path("/nas/dasolbyun/sanjabu/test_v2")
+DEFAULT_METADATA = Path(
+    "/nas/ochansol/3d_model/2026_real_world_test_objects/2026_real_world_test_objects_attr.csv"
+)
 DEFAULT_SCENE = "Home/Uon_1F_Home/floor"
 
 
@@ -99,7 +101,9 @@ class ReferenceEngine:
         self.inference_calls += 1
         with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             state = self.processor.set_image(canvas)
-            output = self.processor.add_geometric_prompt(state=state, box=bundle.normalized_prompt, label=True)
+            # Boxes accumulate in the state; the last call's output reflects all of them.
+            for box in bundle.normalized_prompts:
+                output = self.processor.add_geometric_prompt(state=state, box=box, label=True)
         keep = (output["boxes"][:, 1] + output["boxes"][:, 3]) / 2 >= 504
         boxes = map_boxes_to_original(output["boxes"][keep].float(), transform, tile_y=504).detach().cpu().numpy()
         masks = restore_masks(output["masks"][keep], transform, 504, 504, 1008)
@@ -111,6 +115,7 @@ class ReferenceEngine:
             reference_image=str(bundle.reference_path),
             reference_index=str(scene_index(self.args.reference_root, scene)),
             reference_identity=bundle.identity.metadata(),
+            reference_box_count=len(bundle.normalized_prompts),
             confidence_threshold=self.args.confidence_threshold,
             inference_seconds=time.perf_counter() - started,
             inference_calls=self.inference_calls,

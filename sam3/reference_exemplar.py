@@ -39,6 +39,8 @@ class ReferenceBundle:
     reference_transform: LetterboxTransform
     prompt_box: list[float]
     normalized_prompt: list[float]
+    reference_boxes: list[list[float]]
+    normalized_prompts: list[list[float]]
 
 
 def load_oriented_rgb(path: Path) -> Image.Image:
@@ -102,14 +104,28 @@ def _validate_identity_metadata(
     *,
     source: str,
 ) -> None:
-    """Require an artifact to match the selected immutable catalog row."""
+    """Check the object name and ID; CSV export hashes are not object identity."""
 
-    for field, expected in identity.metadata().items():
+    for field in ("object_name", "object_id"):
+        expected = identity.metadata()[field]
         if field not in document:
             raise ValueError(f"{source} is missing catalog identity field {field!r}.")
         actual = document[field]
         if actual != expected:
             raise ValueError(f"{source} has {field}={actual!r}; expected {expected!r}.")
+
+
+def reference_boxes_from_annotation(annotation: dict) -> list[list[float]]:
+    """`bboxes`가 있으면 그 목록을, 없으면 단일 `bbox`를 반환한다."""
+    first = [float(value) for value in annotation["bbox"]]
+    if "bboxes" not in annotation:
+        return [first]
+    boxes = [[float(value) for value in box] for box in annotation["bboxes"]]
+    if not boxes or any(len(box) != 4 for box in boxes):
+        raise ValueError("bboxes must be a non-empty list of [x1, y1, x2, y2] boxes.")
+    if boxes[0] != first:
+        raise ValueError(f"bbox {first} must equal the first entry of bboxes {boxes[0]}.")
+    return boxes
 
 
 def load_reference_bundle(
@@ -130,26 +146,28 @@ def load_reference_bundle(
     )
     if annotation.get("bbox_format") != "xyxy":
         raise ValueError("The pilot implementation requires bbox_format='xyxy'.")
-    reference_box = [float(value) for value in annotation["bbox"]]
+    reference_boxes = reference_boxes_from_annotation(annotation)
     reference = load_oriented_rgb(reference_path)
     expected_size = (annotation.get("image_width"), annotation.get("image_height"))
     if None not in expected_size and reference.size != expected_size:
         raise ValueError(f"Reference size changed after labeling: JSON={expected_size}, " f"current={reference.size}")
 
     reference_tile, reference_transform = letterbox(reference, tile_width, tile_height)
-    prompt_box = map_box_to_canvas(reference_box, reference_transform, tile_y=0)
+    prompt_boxes = [map_box_to_canvas(box, reference_transform, tile_y=0) for box in reference_boxes]
     # The canvas is square. Keep normalization independent of visualization
     # utilities (which import pandas/sklearn and generate colors at import).
-    normalized_prompt = (box_xyxy_to_cxcywh(torch.tensor(prompt_box).view(1, 4)) / input_size).flatten().tolist()
+    normalized_prompts = (box_xyxy_to_cxcywh(torch.tensor(prompt_boxes)) / input_size).tolist()
     return ReferenceBundle(
         identity=identity,
         object_id=identity.object_id,
         reference_path=reference_path,
-        reference_box=reference_box,
+        reference_box=reference_boxes[0],
         reference_tile=reference_tile,
         reference_transform=reference_transform,
-        prompt_box=prompt_box,
-        normalized_prompt=normalized_prompt,
+        prompt_box=prompt_boxes[0],
+        normalized_prompt=normalized_prompts[0],
+        reference_boxes=reference_boxes,
+        normalized_prompts=normalized_prompts,
     )
 
 

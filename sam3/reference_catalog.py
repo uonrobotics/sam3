@@ -14,6 +14,7 @@ from dataclasses import dataclass
 import hashlib
 import io
 from pathlib import Path
+import re
 import unicodedata
 
 
@@ -144,7 +145,9 @@ def _load_rows(text: str, source_path: Path) -> list[_CatalogRow]:
                 f"Objects metadata {source_path} has duplicate columns: "
                 f"{duplicates}."
             )
-        missing = [column for column in REQUIRED_COLUMNS if column not in fieldnames]
+        cad_attributes = "Old_name" not in fieldnames
+        required = [column for column in REQUIRED_COLUMNS if column != "Old_name"]
+        missing = [column for column in required if column not in fieldnames]
         if missing:
             raise RealObjectCatalogError(
                 f"Objects metadata {source_path} is missing columns: {missing}."
@@ -176,12 +179,14 @@ def _load_rows(text: str, source_path: Path) -> list[_CatalogRow]:
                     f"No={number}."
                 )
             expected_object_id = f"obj_{number:03d}"
-            if values["Class_name"] != expected_object_id:
+            if not cad_attributes and values["Class_name"] != expected_object_id:
                 raise RealObjectCatalogError(
                     f"Objects metadata row {source_line} maps No={number} to "
                     f"Class_name={values['Class_name']!r}; expected "
                     f"{expected_object_id!r}."
                 )
+            if cad_attributes and not re.fullmatch(r"obj_[0-9]{3,}", values["Class_name"]):
+                raise RealObjectCatalogError(f"Invalid CAD Class_name at row {source_line}: {values['Class_name']!r}")
             try:
                 catalog_year = int(values["Year"])
             except ValueError as exc:

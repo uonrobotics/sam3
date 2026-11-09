@@ -92,6 +92,29 @@ def test_reference_readiness_never_runs_prediction():
     assert result["inference_performed"] is False and engine.inference_calls == 0
 
 
+@pytest.mark.parametrize("wrong_field", [None, "object_name", "object_id"])
+def test_cad_reference_uses_name_and_id_independently_of_csv_row_and_hash(tmp_path, wrong_field):
+    metadata = tmp_path / "cad.csv"
+    metadata.write_text("No,Object_name,Class_name, Year\n1,pepper,obj_291,2026\n")
+    Image.new("RGB", (20, 10)).save(tmp_path / "image.png")
+    identity = dict(object_name="pepper", object_id="obj_291", object_catalog_sha256="older-export")
+    if wrong_field:
+        identity[wrong_field] = "other"
+    (tmp_path / "bbox.json").write_text(json.dumps(dict(
+        **identity, bbox_format="xyxy", bbox=[1, 1, 8, 8], image_width=20, image_height=10,
+    )))
+    index = tmp_path / "reference_index.json"
+    index.write_text(json.dumps(dict(objects=dict(pepper=dict(
+        **identity, reference_image="image.png", bbox_annotation="bbox.json",
+    )))))
+    kwargs = dict(reference_index_path=index, metadata_path=metadata, tile_width=1008, tile_height=504, input_size=1008)
+    if wrong_field:
+        with pytest.raises(ValueError, match=wrong_field):
+            reference.load_reference_bundle("pepper", **kwargs)
+    else:
+        assert reference.load_reference_bundle("pepper", **kwargs).object_id == "obj_291"
+
+
 def test_bfloat16_predictions_restore_original_grid_and_serialize(monkeypatch, tmp_path):
     engine = object.__new__(ReferenceEngine)
     engine.args = SimpleNamespace(reference_root=tmp_path, metadata=tmp_path / "catalog.csv", confidence_threshold=0.5)
@@ -100,7 +123,7 @@ def test_bfloat16_predictions_restore_original_grid_and_serialize(monkeypatch, t
         identity=SimpleNamespace(applied_key="pepper", metadata=lambda: dict(object_name="pepper")),
         reference_path=tmp_path / "reference.png",
         reference_tile=Image.new("RGB", (1008, 504)),
-        normalized_prompt=[0.1, 0.1, 0.1, 0.1],
+        normalized_prompts=[[0.1, 0.1, 0.1, 0.1]],
     )
     monkeypatch.setattr(reference, "load_reference_bundle", lambda *a, **kw: bundle)
     masks = torch.zeros((2, 1, 1008, 1008), dtype=torch.bool)
@@ -125,3 +148,75 @@ def test_bfloat16_predictions_restore_original_grid_and_serialize(monkeypatch, t
 def test_reference_scene_stays_inside_configured_root(tmp_path, scene):
     with pytest.raises(ValueError):
         scene_index(tmp_path, scene)
+
+
+def _write_cad_reference(tmp_path, **bbox_fields):
+    metadata = tmp_path / "cad.csv"
+    metadata.write_text("No,Object_name,Class_name,Year\n1,pepper,obj_291,2026\n")
+    Image.new("RGB", (1280, 720)).save(tmp_path / "image.png")
+    identity = dict(object_name="pepper", object_id="obj_291")
+    (tmp_path / "bbox.json").write_text(json.dumps(dict(
+        **identity, bbox_format="xyxy", image_width=1280, image_height=720, **bbox_fields,
+    )))
+    index = tmp_path / "reference_index.json"
+    index.write_text(json.dumps(dict(objects=dict(pepper=dict(
+        **identity, reference_image="image.png", bbox_annotation="bbox.json",
+    )))))
+    return dict(reference_index_path=index, metadata_path=metadata, tile_width=1008, tile_height=504, input_size=1008)
+
+
+def test_reference_bundle_prompts_every_box_and_keeps_first_as_single_prompt(tmp_path):
+    boxes = [[100, 120, 300, 400], [600, 200, 760, 330]]
+    kwargs = _write_cad_reference(tmp_path, bbox=boxes[0], bboxes=boxes)
+    bundle = reference.load_reference_bundle("pepper", **kwargs)
+    assert bundle.reference_boxes == [[float(v) for v in box] for box in boxes]
+    assert len(bundle.normalized_prompts) == 2
+    assert bundle.normalized_prompt == bundle.normalized_prompts[0]
+    assert bundle.reference_box == bundle.reference_boxes[0]
+    scale = bundle.reference_transform.scale
+    expected_cx = ((600 + 760) / 2 * scale + bundle.reference_transform.offset_x) / 1008
+    assert bundle.normalized_prompts[1][0] == pytest.approx(expected_cx)
+
+
+def test_reference_bundle_without_bboxes_uses_single_bbox(tmp_path):
+    kwargs = _write_cad_reference(tmp_path, bbox=[100, 120, 300, 400])
+    bundle = reference.load_reference_bundle("pepper", **kwargs)
+    assert len(bundle.normalized_prompts) == 1 and bundle.normalized_prompts[0] == bundle.normalized_prompt
+
+
+@pytest.mark.parametrize(
+    "fields, message",
+    [
+        (dict(bbox=[1, 2, 3, 4], bboxes=[]), "non-empty"),
+        (dict(bbox=[1, 2, 3, 4], bboxes=[[1, 2, 3]]), "non-empty"),
+        (dict(bbox=[1, 2, 3, 4], bboxes=[[5, 6, 7, 8]]), "first entry"),
+    ],
+)
+def test_reference_bundle_rejects_malformed_bboxes(tmp_path, fields, message):
+    kwargs = _write_cad_reference(tmp_path, **fields)
+    with pytest.raises(ValueError, match=message):
+        reference.load_reference_bundle("pepper", **kwargs)
+
+
+def test_predict_adds_every_reference_box_before_reading_the_result(tmp_path):
+    engine = object.__new__(ReferenceEngine)
+    engine.args = SimpleNamespace(reference_root=tmp_path, metadata=tmp_path / "catalog.csv", confidence_threshold=0.5)
+    engine.cache, engine.inference_calls = {}, 0
+    prompts = [[0.1, 0.1, 0.1, 0.1], [0.5, 0.5, 0.2, 0.2]]
+    engine.reference_bundle = lambda class_id, scene: SimpleNamespace(
+        identity=SimpleNamespace(applied_key="pepper", metadata=lambda: dict(object_name="pepper")),
+        reference_path=tmp_path / "reference.png",
+        reference_tile=Image.new("RGB", (1008, 504)),
+        normalized_prompts=prompts,
+    )
+    received = []
+
+    def add_geometric_prompt(**kw):
+        received.append((kw["box"], kw["label"]))
+        return dict(boxes=torch.zeros((0, 4)), masks=torch.zeros((0, 1, 1008, 1008), dtype=torch.bool),
+                    scores=torch.zeros(0))
+
+    engine.processor = SimpleNamespace(set_image=lambda image: {}, add_geometric_prompt=add_geometric_prompt)
+    result = engine.predict(np.zeros((400, 640, 3), np.uint8), "pepper", "Home/floor")
+    assert received == [(prompts[0], True), (prompts[1], True)]
+    assert json.loads(str(result["metadata"]))["reference_box_count"] == 2
