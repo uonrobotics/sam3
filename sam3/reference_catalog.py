@@ -145,7 +145,8 @@ def _load_rows(text: str, source_path: Path) -> list[_CatalogRow]:
                 f"Objects metadata {source_path} has duplicate columns: "
                 f"{duplicates}."
             )
-        cad_attributes = "Old_name" not in fieldnames
+        # CAD attribute exports use No as a row number, independent of Class_name.
+        cad_attributes = "Old_name" not in fieldnames or "물체명 한글" in fieldnames
         required = [column for column in REQUIRED_COLUMNS if column != "Old_name"]
         missing = [column for column in required if column not in fieldnames]
         if missing:

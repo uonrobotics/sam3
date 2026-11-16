@@ -14,7 +14,7 @@ from urllib.parse import parse_qs, urlsplit
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_REFERENCE_ROOT = Path("/nas/dasolbyun/sanjabu/test_v2")
 DEFAULT_METADATA = Path(
-    "/nas/ochansol/3d_model/2026_real_world_test_objects/2026_real_world_test_objects_attr.csv"
+    "/nas/dasolbyun/sanjabu/2026_real_world_test_objects_attr2.csv"
 )
 DEFAULT_SCENE = "Home/Uon_1F_Home/floor"
 
@@ -81,7 +81,7 @@ class ReferenceEngine:
             inference_performed=False,
         )
 
-    def predict(self, rgb, class_id, scene):
+    def predict(self, rgb, class_id, scene, confidence_threshold=None):
         import numpy as np
         import torch
         from PIL import Image
@@ -89,6 +89,10 @@ class ReferenceEngine:
 
         if rgb.dtype != np.uint8 or rgb.ndim != 3 or rgb.shape[2] != 3 or min(rgb.shape[:2]) < 2:
             raise ValueError("rgb must be uint8 HxWx3")
+        threshold = self.args.confidence_threshold if confidence_threshold is None else confidence_threshold
+        if not 0 <= threshold <= 1:
+            raise ValueError("confidence_threshold must be in [0,1]")
+        self.processor.set_confidence_threshold(threshold)
         bundle = self.reference_bundle(class_id, scene)
         # Require the canonical class name, never a dataset-local obj_NNN join.
         if bundle.identity.applied_key != class_id:
@@ -116,7 +120,7 @@ class ReferenceEngine:
             reference_index=str(scene_index(self.args.reference_root, scene)),
             reference_identity=bundle.identity.metadata(),
             reference_box_count=len(bundle.normalized_prompts),
-            confidence_threshold=self.args.confidence_threshold,
+            confidence_threshold=threshold,
             inference_seconds=time.perf_counter() - started,
             inference_calls=self.inference_calls,
         )
@@ -198,7 +202,10 @@ def main():
                 if not 0 < length <= 40 * 1024 * 1024:
                     raise ValueError("Invalid request size")
                 with np.load(io.BytesIO(self.rfile.read(length)), allow_pickle=False) as packet:
-                    result = engine.predict(packet["rgb"], str(packet["class_id"]), str(packet["reference_scene"]))
+                    threshold = float(packet["confidence_threshold"]) if "confidence_threshold" in packet.files else None
+                    result = engine.predict(
+                        packet["rgb"], str(packet["class_id"]), str(packet["reference_scene"]), threshold
+                    )
                 stream = io.BytesIO()
                 np.savez_compressed(stream, **result)
                 self.reply(200, stream.getvalue(), "application/octet-stream")
