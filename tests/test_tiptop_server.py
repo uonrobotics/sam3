@@ -220,3 +220,16 @@ def test_predict_adds_every_reference_box_before_reading_the_result(tmp_path):
     result = engine.predict(np.zeros((400, 640, 3), np.uint8), "pepper", "Home/floor")
     assert received == [(prompts[0], True), (prompts[1], True)]
     assert json.loads(str(result["metadata"]))["reference_box_count"] == 2
+
+
+def test_generic_reference_skips_the_catalog_and_identity_check(tmp_path):
+    kwargs = _write_cad_reference(tmp_path, bbox=[100, 120, 300, 400])
+    index = json.loads(kwargs["reference_index_path"].read_text())
+    index["objects"] = dict(object=dict(index["objects"]["pepper"], object_name="object", object_id=None))
+    kwargs["reference_index_path"].write_text(json.dumps(index))
+    bbox = tmp_path / "bbox.json"
+    bbox.write_text(json.dumps(dict(json.loads(bbox.read_text()), object_name="object", object_id=None)))
+    bundle = reference.load_reference_bundle("object", **kwargs)
+    assert bundle.identity.applied_key == "object" and bundle.identity.key_namespace == "generic"
+    with pytest.raises(ValueError, match="not found"):
+        reference.load_reference_bundle("pepperoni", **kwargs)

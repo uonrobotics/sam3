@@ -17,6 +17,8 @@ from PIL import Image, ImageOps
 from sam3.model.box_ops import box_xyxy_to_cxcywh
 from sam3.reference_catalog import RealObjectIdentity, resolve_real_object
 
+GENERIC_REFERENCE = "object"
+
 
 @dataclass(frozen=True)
 class LetterboxTransform:
@@ -41,6 +43,19 @@ class ReferenceBundle:
     normalized_prompt: list[float]
     reference_boxes: list[list[float]]
     normalized_prompts: list[list[float]]
+
+
+def generic_identity() -> RealObjectIdentity:
+    return RealObjectIdentity(
+        applied_key=GENERIC_REFERENCE,
+        object_id=GENERIC_REFERENCE,
+        catalog_object_name=GENERIC_REFERENCE,
+        old_name=None,
+        key_namespace="generic",
+        catalog_year=0,
+        object_catalog_sha256="",
+        matched_field="generic",
+    )
 
 
 def load_oriented_rgb(path: Path) -> Image.Image:
@@ -137,12 +152,16 @@ def load_reference_bundle(
     tile_height: int,
     input_size: int,
 ) -> ReferenceBundle:
-    """Reference를 찾아 identity와 함께 검증하고, letterbox/prompt까지 미리 만든다."""
-    identity = resolve_real_object(object_name, metadata_path)
+    """Reference를 찾아 identity와 함께 검증하고, letterbox/prompt까지 미리 만든다.
+
+    `GENERIC_REFERENCE`는 카탈로그에 없는 범용 reference(여러 종류의 물체 예시)여서 카탈로그 조회와 ID 검증을 건너뛴다.
+    """
+    generic = object_name == GENERIC_REFERENCE
+    identity = generic_identity() if generic else resolve_real_object(object_name, metadata_path)
     reference_path, annotation = load_reference_annotation(
         object_name,
         reference_index_path,
-        expected_identity=identity,
+        expected_identity=None if generic else identity,
     )
     if annotation.get("bbox_format") != "xyxy":
         raise ValueError("The pilot implementation requires bbox_format='xyxy'.")
